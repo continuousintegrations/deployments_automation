@@ -1,0 +1,607 @@
+#!/bin/bash -
+# BSS control tool by adam.chalat@comarch.com
+# for all releases run frontend and backend, for 7.1 run also CQRS component (key: CQRS_START), for 7.1, 7.2 run also instance cpm component (key: INSTANCE_CPM_START)
+# PID files are written for each component to directory ~/bin/PID_files (scripts are based on informations contained in this folder)
+# script requires access to RabbitMQ configuration files (queues checking is performed during application status checking)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="24.07.2017r."
+SCRIPT_VERSION="0.3.34"
+
+CURRENT_USER=${USER}
+PID_FILE=~/bin/PID_files/$(basename $0).pid
+trap "rm -f -- '${PID_FILE}'" EXIT # remove PID file on exit
+
+source ~/bin/location_finder
+[[ $1 == '--version' ]] && { echo $(basename `readlink "${SHOW_DEFAULT_PATH}/servers/launcher/current"` | sed 's|.*solution-||'); exit 0; }
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nBSS Suite control tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [server]: `grep ^BSS_APPS ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	echo "Available parameter [task]: start, stop, restart, status"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	echo -e "Available parameter [node]: current (optional - only for current node)\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [server] [task] [environment] [node]")\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- PARAMETERS -------------------------------#
+#--------------------------------------------------------------------#
+
+SERVER_NAME=${1,,}
+JOB=${2,,}
+ENV_NAME=${3^^}
+CUR_NAME=${4,,}
+
+PARENT_PID=$$
+NOERROR=`echo "${@: -1}"` # avoid getting errors, when using server_manage (--noerror)
+ERROR=0 # reset to original state (used during status check)
+
+#--------------------------------------------------------------------#
+#---------------------- PATHS AND VARIABLES -------------------------#
+#--------------------------------------------------------------------#
+
+BSS_HOME=${SHOW_DEFAULT_PATH}/servers/launcher/current
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bss_manage
+SERVERS_ARRAY_FILE=~/bin/servers.arr
+
+ES_USER=$(grep -w ^"${SHOW_ENV_NAME}_ES" ${SERVERS_ARRAY_FILE} | awk '{print $3}')
+ES_PASSWORD=$(grep -w ^"${SHOW_ENV_NAME}_ES" ${SERVERS_ARRAY_FILE} | awk '{print $4}')
+
+LIST=''
+# gather default applications ports
+[[ ${SERVER_NAME} =~ ^(all|frontend)$ ]] && FRONTEND_PORT=$(grep HTTP_PORT ${BSS_HOME}/bss-frontend/instance/config/env/setenv.sh | cut -d"=" -f2) && LIST=+"frontend"
+[[ ${SERVER_NAME} =~ ^(all|backend)$ ]] && BACKEND_PORT=$(grep ^BSS_BACKEND_PORT ${BSS_HOME}/bss-backend/bin/conf.sh | cut -d"=" -f2 | sed 's|.*:||g' | sed 's|[^0-9]||g') && LIST=+"backend"
+[[ ${SERVER_NAME} =~ ^(all|cqrs)$ ]] && [[ `grep ^CQRS_START ~/bin/servers.arr | grep ${ENV_NAME}` ]] && {
+	CQRS_PORT=$(grep ^BSS_BACKEND_PORT ${BSS_HOME}/crm-cqrs/bin/conf.sh | cut -d"=" -f2 | sed 's|.*:||g' | sed 's|[^0-9]||g'); LIST=+"cqrs"
+}
+[[ "${SERVER_NAME}" =~ ^(all|frontend_cpm)$ ]] && [[ `grep ^INSTANCE_CPM_START ~/bin/servers.arr | grep ${ENV_NAME}` ]] && {
+	FRONTEND_CPM_PORT=$(grep HTTP_PORT ${BSS_HOME}/bss-frontend/instance-cpm/config/env/setenv.sh | cut -d"=" -f2); LIST=+"frontend_cpm"
+}
+
+for CHECK_PID in ${LIST}; do
+	[[ ${SERVER_NAME} =~ ^(all|${CHECK_PID})$ ]] && {
+		[[ ! `eval echo '$'${CHECK_PID^^}_PORT` =~ ^[0-9]+$ ]] && {
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") Mismatch during gathering informations from ${CHECK_PID} configuration file (http port)"
+			exit 1
+		}
+	}
+done
+
+#--------------------------------------------------------------------#
+#----------------------- CHECK PARAMETERS ---------------------------#
+#--------------------------------------------------------------------#
+
+declare -a SERVER_NAME_ARR=(`grep ^BSS_APPS ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`)
+declare -a JOB_ARR=("start" "stop" "restart" "status")
+
+if [[ -z $(echo "${SERVER_NAME_ARR[@]:0}" | grep -w ${SERVER_NAME}) ]]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong parameter. Please see below."
+	echo -e "$(colored "31" "[ WARNING ]") Available parameters [server]: `grep ^BSS_APPS ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`\n"
+	exit 1
+elif [[ -z $(echo "${JOB_ARR[@]:0}" | grep -w ${JOB}) ]]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong parameter. Please see below."
+	echo -e "$(colored "31" "[ WARNING ]") Available parameters [task]: start, stop, restart, status\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------ RESTARTING FUNCTION -----------------------#
+#--------------------------------------------------------------------#
+
+function STOP_PROCESSES() {
+	if [[ "${SERVER_NAME}" =~ ^(all|frontend|backend)$ ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w 'FRONTEND\|BACKEND'` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]); then
+		echo -e "\n$(colored "34" "Stopping BSS components on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+		[[ "${SERVER_NAME}" =~ ^(all|frontend)$ ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w FRONTEND` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]) && \
+		kill_frontend_processes "instance/" "BSS-Frontend" "instance.pid"
+		if [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]; then
+			[[ "${SERVER_NAME}" =~ ^(all|frontend_cpm)$ ]] && [[ `grep ^INSTANCE_CPM_START ~/bin/servers.arr | grep ${ENV_NAME}` ]] && kill_frontend_processes "instance-cpm/" "BSS-Frontend Instance" "instance-cpm.pid"
+			[[ "${SERVER_NAME}" =~ ^(all|cqrs)$ ]] && [[ `grep ^CQRS_START ~/bin/servers.arr | grep ${ENV_NAME}` ]] && kill_backend_cqrs_process "crm-cqrs" "CQRS" "crm-cqrs" "cqrs.pid"
+		fi
+		[[ "${SERVER_NAME}" =~ ^(all|backend)$ ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w BACKEND` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]) && \
+		kill_backend_cqrs_process "bss-backend" "Backend" "ts-bss-backend" "backend.pid"
+	fi
+
+	if [[ "${SERVER_NAME}" =~ ^(all|backend)$ ]]; then
+		LEFT_PUBLISH=$(ps -fu `whoami` | grep -P "(?=.*[^]]cpml.*)" | awk '{printf "%s ", $2}')
+		[[ ${LEFT_PUBLISH} ]] && {
+			echo -e "\n$(colored "31" "[ WARNING ]") Found additionally working publishing processes, which has not finished yet"
+			echo -e "$(colored "31" "[ WARNING ]") Terminating processes with PIDs: ${LEFT_PUBLISH}"
+			kill -9 ${LEFT_PUBLISH} &>/dev/null
+		}
+	fi
+}
+
+function kill_frontend_processes() {
+	echo -e "$(colored "32" "[ INFORMATION ]") Stopping $2 process on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	[[ -f ~/bin/PID_files/${@: -1} ]] && APP_PID=`cat ~/bin/PID_files/${@: -1} | awk '{print $2}'`
+
+	if [[ ${APP_PID} ]] && [[ -n "$(ps -p ${APP_PID} -o pid=)" ]]; then
+		function APP_PID() { ps -fu `whoami` | grep bss-frontend | grep $1 | grep -v grep | awk '{printf "%s ", $2}'; }
+
+		if [[ -n $(APP_PID $1) ]] ; then
+			echo "$2 is running with PID: $(APP_PID $1)"
+			kill $(APP_PID $1) &>/dev/null
+
+			KILL_TIMEOUT=20
+			until [[ -z $(APP_PID $1) ]] || [[ ${KILL_TIMEOUT} -eq 0 ]]; do
+				sleep 1
+				let "KILL_TIMEOUT--"
+				if [[ ${KILL_TIMEOUT} -eq 10 ]]; then
+					echo -e "$(colored "31" "[ WARNING ]") $2 is still running with PID: $(APP_PID $1)"
+					echo -e "$(colored "31" "[ WARNING ]") Force killing for remaining PIDs: $(APP_PID $1) on ${IP_ADDRESS} ( ${HOSTNAME} )"
+					kill -9 $(APP_PID $1) &>/dev/null # force kill silently
+				fi
+			done
+
+			if [[ -n $(APP_PID $1) ]]; then
+				echo -e "$(colored "31" "[ WARNING ]") Aborting launched process"
+				echo -e "$(colored "31" "[ WARNING ]") $2 is still running with PID: $(APP_PID $1)"
+				exit 1
+			else
+				echo -e "$2 has been stoppped on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+			fi
+		else
+			echo -e "$2 is $(colored "31" "not working") currently on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+		fi
+	else
+		echo -e "$(colored "33" "[ WARNING ]") $2 process is already stopped"
+	fi
+
+	CHECK_ADDITIONAL_PIDS=$(ps -fu `whoami` | grep -P "(?=.*${1}.*)(?=.*[j]ava.*)" | awk '{printf "%s ", $2}')
+	[[ ${CHECK_ADDITIONAL_PIDS} ]] && {
+		echo -e "\n$(colored "31" "[ WARNING ]") Found additionally working PIDs, which where not shutted down"
+		echo -e "$(colored "31" "[ WARNING ]") Terminating processes with PIDs: ${CHECK_ADDITIONAL_PIDS}"
+		kill -9 ${CHECK_ADDITIONAL_PIDS} &>/dev/null
+	}
+	rm -f ~/bin/PID_files/${@: -1} # remove PID files
+}
+
+function kill_backend_cqrs_process() {
+	echo -e "$(colored "32" "[ INFORMATION ]") Stopping ${2,,} process on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	[[ -f ~/bin/PID_files/${@: -1} ]] && APP_PID=`cat ~/bin/PID_files/${@: -1} | awk '{print $2}'`
+	if [[ ${APP_PID} ]] && [[ -n "$(ps -p ${APP_PID} -o pid=)" ]]; then
+		`find ${BSS_HOME}/$1/bin -name *$(echo $1 | cut -f2 -d"-")*initd.sh` stop
+
+		while [ 1 ]; do
+			sleep 30
+			if [[ -z "$(ps -p ${APP_PID} -o pid=)" ]]; then
+				echo -e "$2 has been stoppped successfully on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+				break
+			else
+				echo -e "\n$(colored "31" "[ WARNING ]") ${2} process was not stopped properly on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+				echo -e "$(colored "31" "[ WARNING ]") Terminating process with ${APP_PID} PID"
+				kill -9 ${APP_PID} &>/dev/null
+			fi
+		done
+	else
+		echo -e "$(colored "32" "[ INFORMATION ]") $2 process is already stopped"
+	fi
+
+	CHECK_ADDITIONAL_PIDS=$(ps -fu `whoami` | grep -P "(?=.*[j]ava.*)(?=.*$1 -Dp7.*)" | awk '{printf "%s ", $2}')
+	[[ ${CHECK_ADDITIONAL_PIDS} ]] && {
+		echo -e "\n$(colored "31" "[ WARNING ]") Found additionally working PIDs, which do not belong to current version of binaries"
+		echo -e "$(colored "31" "[ WARNING ]") Force killing for remaining PIDs: ${CHECK_ADDITIONAL_PIDS}"
+		kill -9 ${CHECK_ADDITIONAL_PIDS} &>/dev/null
+	}
+	rm -f ~/bin/PID_files/${@: -1} # remove PID files
+}
+
+#--------------------------------------------------------------------#
+#------------------------- STARTING FUNCTION ------------------------#
+#--------------------------------------------------------------------#
+
+function START_PROCESSES() {
+	if [[ "${SERVER_NAME}" =~ ^(all|frontend|backend)$ ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w 'FRONTEND\|BACKEND'` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]); then
+		echo -e "\n$(colored "34" "Starting BSS components on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+		[[ "${SERVER_NAME}" =~ ^(all|backend)$ ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w BACKEND` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]) && \
+		start_backend_process "backend.pid"
+		[[ "${SERVER_NAME}" =~ ^(all|frontend)$ ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w FRONTEND` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]) && \
+		start_frontend_processes "Frontend" "instance" "instance.pid" "${FRONTEND_PORT}"
+		if [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]; then
+			[[ "${SERVER_NAME}" =~ ^(all|frontend_cpm)$ ]] && [[ `grep ^INSTANCE_CPM_START ~/bin/servers.arr | grep ${ENV_NAME}` ]] && start_frontend_processes "Frontend instance-cpm" "instance-cpm" "instance-cpm.pid" "${FRONTEND_CPM_PORT}"
+			[[ "${SERVER_NAME}" =~ ^(all|cqrs)$ ]] && [[ `grep ^CQRS_START ~/bin/servers.arr | grep ${ENV_NAME}` ]] && start_cqrs_process "cqrs.pid"
+		fi
+	fi
+}
+
+function start_backend_process() {
+	[[ -f ~/bin/PID_files/${@: -1} ]] && APP_PID=`cat ~/bin/PID_files/${@: -1} | awk '{print $2}'`
+	echo -e "$(colored "32" "[ INFORMATION ]") Starting Backend process on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	if [[ ${APP_PID} ]] && [[ -n "$(ps -p ${APP_PID} -o pid=)" ]]; then
+		echo -e "$(colored "31" "[ WARNING ]") Backend process is already running. Aborting launch process."
+	else
+		export BSS_BACKEND_MEM=2048
+		BACKEND_SCRIPT=$(find ${BSS_HOME}/bss-backend/bin -name *backend*initd.sh)
+		if [[ ${BACKEND_SCRIPT} ]]; then
+			${BACKEND_SCRIPT} start
+			ps -fu `whoami` | grep -P "(?=.*`readlink -f ${BSS_HOME}/bss-backend`.*)(?=.*java.*)" | grep -v grep > ~/bin/PID_files/backend.pid
+		else
+			echo -e "$(colored "31" "[ WARNING ]") Backend management script is not present on server. Please deploy needed files to ${BSS_HOME}/bss-backend/bin location."
+			exit 1 
+		fi
+	fi
+}
+
+function start_cqrs_process() {
+	[[ -f ~/bin/PID_files/${@: -1} ]] && APP_PID=`cat ~/bin/PID_files/${@: -1} | awk '{print $2}'`
+	echo -e "$(colored "32" "[ INFORMATION ]") Starting CQRS process on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	if [[ ${APP_PID} ]] && [[ -n "$(ps -p ${APP_PID} -o pid=)" ]]; then
+		echo -e "$(colored "31" "[ WARNING ]") CQRS process is already running. Aborting launch process."
+	else
+		if [ -f ${BSS_HOME}/crm-cqrs/bin/crm-cqrs-initd.sh ]; then
+			cd ${BSS_HOME}/crm-cqrs/bin # script is calling secondary script (based on relative path)
+			./crm-cqrs-initd.sh start
+			ps -fu `whoami` | grep -P "(?=.*`readlink -f ${BSS_HOME}/crm-cqrs`.*)(?=.*java.*)" | grep -v grep > ~/bin/PID_files/cqrs.pid
+		else
+			echo -e "$(colored "31" "[ WARNING ]") CQRS management script is not present on server. Please deploy needed files to ${BSS_HOME}/crm-cqrs/bin location."
+			exit 1 
+		fi
+	fi
+}
+
+function start_frontend_processes() {
+	[[ -f ~/bin/PID_files/${@: -1} ]] && APP_PID=`cat ~/bin/PID_files/${@: -1} | awk '{print $2}'`
+	echo -e "$(colored "32" "[ INFORMATION ]") Starting $1 process on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	if [[ ${APP_PID} ]] && [[ -n "$(ps -p ${APP_PID} -o pid=)" ]]; then
+		echo -e "$(colored "31" "[ WARNING ]") $1 process is already running. Aborting launch process."
+	else
+		if [ -f ${BSS_HOME}/bss-frontend/$2/bin/launch.sh ]; then
+			cd ${BSS_HOME}/bss-frontend/$2/bin # script is calling secondary script (based on relative path)
+			./launch.sh start > /dev/null 2>&1 &
+		else
+			echo -e "$(colored "31" "[ WARNING ]") $1 management script is not present on server. Please deploy needed files to ${BSS_HOME}/bss-frontend/$2/bin location."
+			exit 1 
+		fi
+		sleep 15 # wait until frontend will start
+		ps -fu `whoami` | grep -P "(?=.*${2}/.*)(?=.*java.*)(?=.*`readlink -f ${BSS_HOME}/bss-frontend/bin`.*)"  | grep -v grep > ~/bin/PID_files/$2.pid
+	fi
+
+	if [[ `grep ^SYSTEM_VERSION ~/bin/servers.arr | awk '{print $2}'` -ge 73 ]]; then
+		counter=1
+		while [ 1 ]; do
+			if [[ `wget --timeout=10 --tries=1 --spider http://${IP_ADDRESS}:$4/csrt/auth -O - 2>&1` =~ '200 OK' ]]; then
+				echo -e "$(colored "32" "[ INFORMATION ]") BSS frontend is responding on port $4"
+				break
+			elif [ $counter -eq 20 ]; then
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") BSS frontend login screen is unreachable ( http://${IP_ADDRESS}:$4/csrt/auth )"
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") Component logfiles: `readlink "${SHOW_DEFAULT_PATH}/servers/launcher/current/bss-frontend/instance/log"`"
+				exit 1
+			fi
+			echo "[$counter out of 20] Waiting for BSS frontend on ${IP_ADDRESS} ( ${HOSTNAME} ) -" $((15*$counter)) "sec"
+			counter=$(($counter+1))
+			sleep 15
+		done
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- STATUS FUNCTION --------------------------#
+#--------------------------------------------------------------------#
+
+function STATUS_PROCESSES() {
+	if [[ "${SERVER_NAME}" =~ ^(all|frontend|backend)$ ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w 'FRONTEND\|BACKEND'` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]); then
+		echo -e "\n$(colored "34" "Testing BSS modules on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+		[[ "${SERVER_NAME}" =~ ^(all|backend)$ ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w BACKEND` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]) && {
+			BACKEND_WGET=$(wget --timeout=10 --tries=3 --spider http://${IP_ADDRESS}:${BACKEND_PORT} -O - 2>&1)
+			status_backend_cqrs_process "bss-backend" "backend.pid" "${BACKEND_WGET}" "${BACKEND_PORT}"
+		}
+		[[ "${SERVER_NAME}" =~ ^(all|frontend)$ ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w FRONTEND` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]) && {
+			[[ ${SERVER_NAME} =~ ^(all|frontend)$ ]] && FRONTEND_WGET=$(wget --timeout=10 --tries=3 --spider http://${IP_ADDRESS}:${FRONTEND_PORT} -O - 2>&1)
+			status_frontend_processes "bss-frontend" "instance.pid" "${FRONTEND_WGET}" "${FRONTEND_PORT}"
+		}
+		if [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]; then
+			[[ "${SERVER_NAME}" =~ ^(all|frontend_cpm)$ ]] && [[ `grep ^INSTANCE_CPM_START ~/bin/servers.arr | grep ${ENV_NAME}` ]] && {
+				FRONTEND_CPM_WGET=$(wget --timeout=10 --tries=3 --spider http://${IP_ADDRESS}:${FRONTEND_CPM_PORT} -O - 2>&1)
+				status_frontend_processes "instance-cpm" "instance-cpm.pid" "${FRONTEND_CPM_WGET}" "${FRONTEND_CPM_PORT}"
+			}
+			[[ "${SERVER_NAME}" =~ ^(all|cqrs)$ ]] && [[ `grep ^CQRS_START ~/bin/servers.arr | grep ${ENV_NAME}` ]] && {
+				CQRS_WGET=$(wget --timeout=10 --tries=3 --spider http://${IP_ADDRESS}:${CQRS_PORT} -O - 2>&1)
+				status_backend_cqrs_process "crm-cqrs" "cqrs.pid" "${CQRS_WGET}" "${CQRS_PORT}"
+			}
+		fi
+	fi
+
+	if [[ ${SERVER_NAME} =~ ^(all|backend)$ ]]; then
+		if [[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w 'RMQ'` ]] || ([[ ${IP_ADDRESS} == ${LOCAL_HOST} ]] && [[ ${SHOW_ENV_TYPE} == 'CPM' ]]); then
+			# RabbitMQ default homedir is different for various projects
+			for LOCATION in ${SHOW_DEFAULT_PATH} ${SHOW_DEFAULT_PATH}/servers; do [[ -f ${LOCATION}/rabbitmq/rabbitmq.sh ]] && { RMQ_HOME=${LOCATION}/rabbitmq; break; }; done
+			
+			if [[ -z ${RMQ_HOME} ]]; then
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") RabbitMQ home directory was not found on `whoami`@${IP_ADDRESS} host"
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") Skipping queued messages stack verification"
+				ERROR=1
+			else
+				RMQ_USER=$(grep default_user ${RMQ_HOME}/rabbitmq.config | sed 's/">>.*//' | sed 's/.*<<"//g' | tail -n1)
+				RMQ_PASSWORD=$(grep default_pass ${RMQ_HOME}/rabbitmq.config | sed 's/">>.*//' | sed 's/.*<<"//g' | tail -n1)
+				PORT=$(grep rabbitmq_management ${RMQ_HOME}/rabbitmq.config | sed 's/}.*//' | sed 's/.*, //g' | tail -n1)
+
+				# while loop in Bash creates a subshell (when the subshell exits, all variables return to their previous values)
+				echo; COUNT_QUEUES=0; COUNT_MESSAGES=0
+				while read line; do
+					if [[ `echo $line | awk '{print $2}' | sed 's|[^0-9]*||g'` -gt 0 ]]; then
+						CURL_RESPONSE=$(curl --user ${RMQ_USER}:${RMQ_PASSWORD} -XGET -s http://${IP_ADDRESS}:${PORT}/api/queues/%2F/`awk '{print $1}' <<< $line`)
+						QUEUE_CONSUMER=$(grep -Po '"consumers":.*?,' <<< ${CURL_RESPONSE} | sed 's|[^0-9]*||g')
+						COUNT_MESSAGES=$((COUNT_MESSAGES + `echo $line | awk '{print $2}'`))
+						COUNT_QUEUES=$(expr ${COUNT_QUEUES} + 1)
+
+						[[ ${QUEUE_CONSUMER} -eq 0 ]] && {
+							COUNT_ERROR_MESSAGES=$((COUNT_MESSAGES + `echo $line | awk '{print $2}'`))
+							COUNT_QUEUES_ERROR=$(expr ${COUNT_QUEUES_ERROR} + 1)
+							echo -e "$(colored "31" "[ QUEUE ${COUNT_QUEUES_ERROR} ]") `awk '{print $1, "has", $2}' <<< ${line^^}` messages which are not published to any consumers"
+						}
+					fi
+				done < <(${RMQ_HOME}/rabbitmq.sh ctl list_queues)
+
+				if [[ ${COUNT_QUEUES_ERROR} -gt 0 ]]; then
+					echo -e "$(colored "31" "[ CRITICAL WARNING ]") ${COUNT_QUEUES_ERROR} queues have no consumers - pending ${COUNT_ERROR_MESSAGES} messages (components belonging to BSS SUITE should be checked)"
+					ERROR_QUEUES=1
+				else 
+					[[ ${COUNT_MESSAGES} -gt 0 ]] && \
+					echo -e "$(colored "32" "[ INFORMATION ]") Total number of queued messages: ${COUNT_MESSAGES} (belonging to ${COUNT_QUEUES} queues)" || \
+					echo -e "$(colored "32" "[ INFORMATION ]") There are no queued messages on RabbitMQ stack"
+				fi
+			fi
+		fi
+	fi
+
+    # check if BSS has fully started
+    [[ ${PID_ERROR} -eq 1 ]] && { echo -e "$(colored "31" "[ CRITICAL ERROR ]") Control files should be veryfied. Please contact ITOPS department."; }
+    if [[ ${ERROR} -eq 1 ]]; then
+    	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") BSS Suite has not fully started. Please contact ITOPS department in urgent cases."
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Application home directory: `readlink "${SHOW_DEFAULT_PATH}/servers/launcher/current"`"
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Components configuration: bss-backend/conf and bss-frontend/instance/config/services"
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Components logfiles: bss-backend/log/`date +%Y`/`date +%m`/`date +%d` and bss-frontend/instance/log/`date +%Y`/`date +%m`/`date +%d`"
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Correctness of application configuration, databases availability and health of ElasticSearch cluster should be veryfied."
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Broken application modules should be restarted by accessing mubemanage script."
+    	[[ ${NOERROR} != '--noerror' ]] && exit 1 || :
+    fi
+}
+
+function get_process_parameters() {
+	stime=`ps -p $1 -o lstart= | awk '{print $2 $3}'` # start day
+	upwork=`ps -p $1 -o lstart= | awk '{print $4}'` # start time
+	cpu=`ps -p $1 -o %cpu= | awk '{print $1}'` # cpu load
+	memory=`ps -p $1 -o %mem= | awk '{print $1}'` # memory load
+	echo -e "PID: [ $(colored "35" "$(printf "%5d" $APP_PID)") ] Stime: [ $(colored "36" "$stime") $(colored "36" "$upwork") ]" \
+	"CPU: [ $(colored "31" "$(printf "%4s" $cpu)") ] PMEM: [ $(colored "33" "$(printf "%4s" $memory)") ] ${component^^} $(colored "32" "is responding") on port $2"
+}
+
+function status_frontend_processes() {
+	local component=$1
+	APP_PID=`cat ~/bin/PID_files/$2 2>/dev/null | awk '{print $2}'` 2>/dev/null
+	if [[ ${APP_PID} ]] && [[ ${APP_PID} =~ ^[0-9]+$ ]] && [[ $3 =~ .*${IP_ADDRESS}:$4.*connected ]]; then
+		[[ -n "$(ps -p ${APP_PID} -o pid=)" ]] && get_process_parameters ${APP_PID} $4 || { echo -e "${2^^} is $(colored "31" "not running")"; ERROR=1; }
+	else
+		([[ ${APP_PID} ]] && [[ ! ${APP_PID} =~ ^[0-9]+$ ]]) && \
+		{ echo -e "$(colored "33" "[ WARNING ]") ${component^^} PID is not written properly to ~/bin/PID_files/$2"; PID_ERROR=1; } || { echo -e "${component^^} is $(colored "31" "not running")"; ERROR=1; }
+	fi
+}
+
+function status_backend_cqrs_process() {
+	local component=$1
+	APP_PID=`cat ~/bin/PID_files/$2 2>/dev/null | awk '{print $2}'`
+	SCRIPT_NAME=`find ${BSS_HOME}/$1/bin -name *$(echo $1 | cut -f2 -d"-")*initd.sh`
+
+	if [[ ${APP_PID} ]] && [[ ${APP_PID} =~ ^[0-9]+$ ]]; then
+		[[ `${SCRIPT_NAME} status | grep "stopped\|not\ running" | wc -l` -eq 0 ]] && get_process_parameters ${APP_PID} $4 || { echo `${SCRIPT_NAME} status`; ERROR=1; }
+	else
+		([[ ${APP_PID} ]] && [[ ! ${APP_PID} =~ ^[0-9]+$ ]]) && \
+		{ echo -e "$(colored "33" "[ WARNING ]") ${component^^} PID is not written properly to ~/bin/PID_files/$2"; PID_ERROR=1; } || echo `${SCRIPT_NAME} status`; ERROR=1
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- REMOTE HOSTS -----------------------------#
+#--------------------------------------------------------------------#
+
+function REMOTE_BSS() {
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		if [ "${SERV[0]}" = "${SHOW_ENV_NAME}" -a "${SERV[1]}" = "CPM" -a "${SERV[3]}" != "1" ]; then
+			ssh -qo BatchMode=yes ${SERV[2]} "bash -l -c 'bss_manage $1 $2 ${ENV_NAME}'" 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED."
+			PIPE_EXIT_STATUS=${PIPESTATUS[0]}
+			[[ $2 == 'status' ]] && [[ ${PIPE_EXIT_STATUS} -eq 1 ]] && ERROR=1
+		fi
+	done
+}
+
+#--------------------------------------------------------------------#
+#------------------------- COPYING SCRIPTS --------------------------#
+#--------------------------------------------------------------------#
+
+function MD5_SUM() {
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		# update scripts for current environment, declared environment type and for nodes that are different than set: current IP and current user
+		if [[ "${SERV[0]}" = "${SHOW_ENV_NAME}" && "${SERV[1]}" == 'CPM' && "${SERV[6]} ${SERV[4]}" != "${IP_ADDRESS} ${CURRENT_USER}" ]]; then
+			SSH_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${SERV[4]}@${SERV[2]} echo confirmed 2>&1)
+			if [[ $SSH_STATUS == 'confirmed' ]]; then
+				SUM=(`ssh -qo BatchMode=yes ${SERV[4]}@${SERV[2]} md5sum $(echo ${SCRIPT_DIR} | sed "s|${CURRENT_USER}|${SERV[4]}|g") 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED."`)
+				if [[ ${md5_local[0]} != ${SUM[0]} ]]; then
+					RESULT=$(scp -pq ${SCRIPT_DIR} ${SERV[4]}@${SERV[2]}:$(echo ${SCRIPT_DIR} | sed "s|${CURRENT_USER}|${SERV[4]}|g") 2>&1); CODE=$?
+					if [ ${CODE} -ne 0 ]; then
+						echo -e "$(colored "31" "[ WARNING ]") Script `basename "$0"` encountered errors during scripts update (please contact ITOPS department)"
+						echo -e "$(colored "31" "[ WARNING ]") Error code: ${CODE}"
+						echo -e "$(colored "31" "[ WARNING ]") Error line: ${RESULT}"
+						exit 1
+					fi
+				fi
+			else
+				echo -e "$(colored "31" "[ WARNING ]") Script `basename "$0"` encountered errors during execution (please contact ITOPS department)"
+				echo -e "$(colored "31" "[ WARNING ]") SSH connection to remote host: ${SERV[4]}@${SERV[2]} is denied"
+				exit 1
+			fi
+		fi
+	done
+}
+
+#--------------------------------------------------------------------#
+#------------------------- PRECONDITIONS ----------------------------#
+#--------------------------------------------------------------------#
+
+# check if user links to proper environment
+if [ ${SHOW_ENV_NAME,,} != ${ENV_NAME,,} ]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong environment was definied during script induction."
+	echo -e "$(colored "31" "[ WARNING ]") Current environment: ${SHOW_ENV_NAME^^}. Definied environment: ${ENV_NAME^^}.\n"
+	exit 1
+fi
+
+# check if another process is running in parallel
+if [[ "${JOB}" =~ ^(stop|restart|start)$ ]]; then
+	mkdir -p ~/bin/PID_files # create required folders
+	([[ -f "${PID_FILE}" ]] && [[ `cat ${PID_FILE}` ]]) && echo -e "$(colored "31" "[ WARNING ]") Another process with `cat ${PID_FILE}` PID is already written to $(basename $0).pid lockfile on ${IP_ADDRESS} ( ${HOSTNAME} )"
+	for CHECK_ANOTHER_PID in $(pidof -x $(basename $0)); do
+		if [ ${CHECK_ANOTHER_PID} != ${PARENT_PID} ]; then
+			echo -e "$(colored "31" "[ WARNING ]") Terminating already running process with ${CHECK_ANOTHER_PID} PID on ${IP_ADDRESS} ( ${HOSTNAME} )"
+			kill -9 ${CHECK_ANOTHER_PID} &>/dev/null # kill silently
+		fi
+	done
+	echo ${PARENT_PID} > "${PID_FILE}"
+fi
+
+# checking if addiotional nodes are present and meet the requirements of release
+([[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]] && [[ ${REMOTE_HOST} != '0' ]] && [[ ! "${CUR_NAME}" =~ ^(current|noerror)$ ]]) && [[ "${SYSTEM_VERSION}" -ge '72' ]] && CHECK_NODES="TRUE"
+
+[[ ! `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w 'FRONTEND\|BACKEND'` ]] && {
+	echo -e "\n$(colored "31" "[ INFORMATION ]") Application has not been configured according to high availability requirements"
+	echo -e "$(colored "31" "[ INFORMATION ]") Binaries need to be deployed and configured on remote hosts. Please contact ITOPS department."
+	CHECK_HA_APP='FALSE'
+} || CHECK_HA_APP='TRUE'
+
+# ElasticSearch must working to start properly BSS Suite
+if [ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]  && [[ "${JOB}" =~ ^(restart|start|status)$ ]]; then
+	ES_HTTP_PORT=$(grep ^http.port `find ${SHOW_DEFAULT_PATH}/servers/ES/*/config -type f -not -path "*bpc*" -name "elasticsearch.yml"` | head -n1 | awk -F: '{print $NF}' | awk '$1 ~ /[0-9]+$/ {print $1}')
+	[[ ! ${ES_HTTP_PORT} =~ ^[0-9]+$ ]] && echo -e "$(colored "31" "[ CRITICAL ERROR ]") Mismatch during gathering informations from ElasticSearch's config"
+
+	echo -e "\n$(colored "33" "[ INITIAL REQUIREMENT ]") Checking status of ElastiSearch's cluster health"
+
+	SEARCH_BIND_HOST=$(grep "^network.host\|^network.bind_host" `find ${SHOW_DEFAULT_PATH}/servers/ES/*/config -type f -not -path "*bpc*" -name "elasticsearch.yml" | head -n1` | cut -d":" -f2 | tr -d '[:space:]')
+	[[ -z ${SEARCH_BIND_HOST} ]] && { echo -e "$(colored "31" "[ WARNING ]") Key network.host for BSS cluster is not set on ${IP_ADDRESS} (ElasticSearch is binded to 0.0.0.0 address)"; SEARCH_BIND_HOST='0.0.0.0'; }
+
+	[[ $(curl --user ${ES_USER}:${ES_PASSWORD} --max-time 10 --retry 3 -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}/_cluster/health | awk -F"," '{ print $2 }' | awk -F ":" '{ print $2 }' | sed 's/"//g') == 'green' ]] && \
+	echo -e "$(colored "32" "[ CONFIRMATION ]") ElasticSearch is working on ${ES_HTTP_PORT} HTTP port" || \
+	{ echo -e "$(colored "31" "[ CRITICAL ERROR ]") ElasticSearch is not working correctly (required green status of cluster health)"; exit 1; }
+
+	if [[ ${CHECK_NODES} == 'TRUE' ]]; then
+		echo -e "\n$(colored "33" "[ INITIAL REQUIREMENT ]") Checking binaries data match"
+		for SERVER in "${SERVERS_ARRAY[@]}"; do
+			SERV=($SERVER)
+			if [[ "${SERV[0]}" == "${SHOW_ENV_NAME}" ]] && [[ "${SERV[1]}" == "CPM" ]] && [[ "${SERV[6]}" != "${IP_ADDRESS}" ]]; then
+				CURRENT_BACKEND_VERSION=$(basename `readlink "${SHOW_DEFAULT_PATH}/servers/launcher/current"` | sed 's|.*solution-||')
+				BACKEND_VERSION=$(ssh -qo BatchMode=yes ${SERV[2]} "bash -l -c 'echo $(basename `readlink "${SHOW_DEFAULT_PATH}/servers/launcher/current"` | sed 's|.*solution-||')'" 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED.")
+				
+				[[ ${BACKEND_VERSION} != ${CURRENT_BACKEND_VERSION} ]] && \
+				{ echo -e "$(colored "31" "[ WARNING ]") Backend binaries mismatch between ${CURRENT_USER}@${IP_ADDRESS} and ${SERV[4]}@${SERV[2]} nodes"; exit 1; } || \
+				echo -e "$(colored "32" "[ CONFIRMATION ]") Deployed release is matched on all remote hosts - $(basename `readlink "${SHOW_DEFAULT_PATH}/servers/launcher/current"` | sed 's|.*solution-||')"
+			fi
+		done
+	fi
+
+	if type nmap &>/dev/null; then
+		# veryfing RabbitMQ cluster status - transport ports
+		RABBITMQ_VERIFICATION=FALSE
+		echo -e "\n$(colored "33" "[ INITIAL REQUIREMENT ]") Checking RabbitMQ cluster status (transport port availability)"
+		for rabbitmq_nodes in $(grep ^${SHOW_ENV_NAME^^}_RABBIT_NODES ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'); do
+			RABBITMQ_HOST=${rabbitmq_nodes%:*}; RABBITMQ_PORT=${rabbitmq_nodes#*:}
+
+			PORT_STATUS=$(nmap ${RABBITMQ_HOST} -p ${RABBITMQ_PORT} 2>&1 | grep ^${RABBITMQ_PORT} | awk '{print $2}')
+			[[ ${PORT_STATUS} == 'open' ]] && { echo -e "$(colored "32" "[ CONFIRMATION ]") Transport ${RABBITMQ_PORT} port is open by ${RABBITMQ_HOST} host"; RABBITMQ_VERIFICATION='TRUE'; }
+			break
+		done
+
+		[[ ${RABBITMQ_VERIFICATION} == 'FALSE' ]] && {
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") None of declared RabbitMQ clustered nodes is reachable"
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") Application status has to be veryfied. Please contact ITOPS department in urgent cases."
+			exit 1
+		}
+	else
+		echo -e "$(colored "31" "[ WARNING ]") Command 'nmap' is unavailable. Skipping RabbitMQ verification."
+	fi
+fi
+
+# update scripts on all nodes - comparing to main node
+if [[ "${JOB}" =~ ^(stop|restart|start|status)$ ]] && [[ -z $(echo "$@" | grep -w 'current') ]]; then
+	if [ "${IP_ADDRESS}" = "${LOCAL_HOST}" ] && [ ${REMOTE_HOST} != '0' ]; then
+		md5_local=`md5sum ${SCRIPT_DIR} | awk '{ print $1 }'`
+		MD5_SUM
+	fi
+fi
+
+# validation of working processes
+function check_processes_number() {
+	for PID_FILE_CHECK in `find ~/bin/PID_files -type f \( -iname "backend.pid" -o -iname "instance-cpm.pid" -o -iname "instance.pid" -o -iname "cqrs.pid" \)`; do
+		if [ `awk '{print $2}' ${PID_FILE_CHECK} | wc -l` -ne 1 ]; then
+			echo -e "$(colored "31" "[ WARNING ]") Number of working processes does not agree with requirements (one instance process can run at the same time)."
+			echo -e "$(colored "31" "[ WARNING ]") Please check working PIDs and application logfiles. Wrongly opened instances should be turned off manually (${PID_FILE_CHECK} file)."
+			exit 1
+		fi
+	done
+}
+
+# check if something did not go wrong (restart executes on remote host script two times)
+function CHECK_PROCESS() {
+	APP_ERROR=0 # reset values to initial state
+	CHECK_WORKING_PROCESSES=$(ps -fu `whoami` | grep -P "(?=.*${2}.*)(?=.*java.*)(?=.*`readlink -f ${BSS_HOME}/${1}`.*)" | grep -v grep | awk '{print $2}')
+	if [[ ${CHECK_WORKING_PROCESSES} ]]; then
+		PROCESS_PID=$(cat ~/bin/PID_files/${3}.pid | awk '{print $2}')
+		[[ ! ${CHECK_WORKING_PROCESSES} -eq ${PROCESS_PID} ]] && APP_ERROR=1
+	fi &>/dev/null
+
+	if [[ ${APP_ERROR} -eq 1 ]]; then
+		echo -e "\n$(colored "31" "[ WARNING ]") Some of working processes were not written to semaphore files: ~/bin/PID_files/${3}.pid"
+		echo -e "$(colored "31" "[ WARNING ]") Currently working process's PID: ${CHECK_WORKING_PROCESSES}. Written PID: `[[ ${PROCESS_PID} ]] && echo ${PROCESS_PID} || echo 'empty_string'`"
+		echo -e "$(colored "31" "[ WARNING ]") Remaining processes should be stopped manually or script should be launched with 'restart' option\n"
+		exit 1
+	fi
+}
+
+# validation: compare working processes with PIDs written to semaphore files (only if any processes are working)
+if [[ "${JOB}" =~ ^(start|status)$ ]]; then
+	# important only when starting applications and checking status (stop is turning off all applications)
+	CHECK_PROCESS "bss-backend" "backend" "backend" # first parameter: component location, second parameter: what to grep, third parameter: PID file name
+	([[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]] || [[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w FRONTEND` ]]) && CHECK_PROCESS "bss-frontend/bin" "instance/" "instance"
+	[[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]] && [[ `grep ^INSTANCE_CPM_START ~/bin/servers.arr | grep ${ENV_NAME}` ]] && CHECK_PROCESS "bss-frontend/bin" "instance-cpm/" "instance-cpm"
+	[[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]] && [[ `grep ^CQRS_START ~/bin/servers.arr | grep ${ENV_NAME}` ]] && CHECK_PROCESS "bss-backend" "bss-cqrs" "cqrs"
+	check_processes_number
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTIONS CALL ---------------------------#
+#--------------------------------------------------------------------#
+
+# create tasks list if was definied switch requiring serveral basic tasks
+[[ "${JOB}" == 'restart' ]] && PROCESS_TASK="stop start status" || PROCESS_TASK="${JOB}"
+
+for TASK in ${PROCESS_TASK}; do
+	# execute task on remote hosts only when script was launched from localhost and has no additional arguments pointing to current host and application is configured according to HA requirements
+	[[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]] && [[ -z $(echo "$@" | grep -w 'current') ]] && [[ ${CHECK_NODES} = "TRUE" ]] && [[ ${CHECK_HA_APP} == 'TRUE' ]] && REMOTE_BSS "${SERVER_NAME}" "${TASK}"
+	! ([[ "${IP_ADDRESS}" != "${LOCAL_HOST}" ]] && [[ ${CHECK_HA_APP} == 'FALSE' ]]) && "${TASK^^}"_PROCESSES
+done
+
+#--------------------------------------------------------------------#
+#----------------------- REQUIREMENTS CHECK -------------------------#
+#--------------------------------------------------------------------#
+
+check_processes_number # check number of working instances of particular process

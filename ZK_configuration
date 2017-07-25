@@ -1,0 +1,451 @@
+#!/bin/bash -
+# zooKeeper configuration upgrade tool by adam.chalat@comarch.com
+# in order to exclude GitLab merging and copy files included in package there should be modified servers.arr file (key: ZK_GIT with suffix: DOWNLOAD or/and UPLOAD)
+# script is based on the date of the modification files (before and after swapping files)
+# validation is based on timestamp - system time and client processing event time
+# used znodes are listed in servers.arr configuration file (ZK watcher should be restarted, if client's name was changed)
+# first launch of ZooKeeper server required creation of /states head folder, which is performed by executing command: create /states states (script ./zkCli.sh)
+# required servers.arr configuration keys: GIT_ZOOKEEPER_REMOTE, HOT_DEPLOY, UPDATE_ZOOKEEPER_REPOSITORY, ZK_MERGE, ZK_GIT
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="21.07.2017r."
+SCRIPT_VERSION="0.3.22"
+
+STEP_NAME="ZK_configuration_copy"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep CRM | head -n1 | awk '{ print $6 }'`
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 2 ]; then
+	echo -e "\nZooKeeper configuration upgrade tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	echo -e "Available parameter [optional]: --update\n"
+	echo -e "$(colored "31" "[ WARNING ]") Changes should be made in GitLab or directly in ${BIN_REPO}/configuration"
+	echo -e "$(colored "31" "[ WARNING ]") Configuration keys in servers.arr: ZK_GIT and \${ENV}_CONFIGURATION\n"
+	echo -e "Usage: $(colored "34" "ZK_configuration [version] [environment] [optional]")\n"
+	stop_deployment "Incorrect induction of $(basename $0) script"
+fi
+
+#--------------------------------------------------------------------#
+#---------------------- PATHS AND VARIABLES -------------------------#
+#--------------------------------------------------------------------#
+
+check_source # check presence of repository source in repo-bin directory (first display help)
+
+TEMP_DIR=${RHOME}/Temp_Install
+DIRECTORY=${TEMP_DIR}/${VERSION}/${ENV}
+DEST_DIR=${RHOME}/config_management/data/files
+ARCH_CONF=${RHOME}/config_management/archive_ZK_configurations
+
+ZK_BRANCH=$(grep ^ZK_MERGE ${SERVERS_ARR_FILE} | awk '{print $2}')
+ZK_CUSTOM_FOLDER=$(grep ^ZK_MERGE ${SERVERS_ARR_FILE} | awk '{print $3}')
+ZNODE_RESPONSE_ERROR=0 # reset to original state (variable notyfing about problems with znodes)
+
+ZIP_FILE=`find ${CRM_DIR} -name CentralConfigurationServerFiles*.tar.gz`
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function copy_ZK_manage_script() {
+	RESULT=$(scp -pq ${TOSERVERS_PATH}/{zk_manage,location_finder} ${SERVERS_ARR_FILE} ${USER}@${HOST}:${BIN_DIR} 2>&1)
+	CODE=$?; check_errors
+	run_remote_command ${HOST} "chmod 764 ${BIN_DIR}/zk_manage"
+}
+
+function update_repository() {
+	git fetch # download data to local repository without merging
+	if [[ $(git rev-parse HEAD) = $(git rev-parse @{u}) ]]; then 
+		fLog "$(colored "32" "[ INFORMATION ]") Local repository and resources in GitLab are up to date"
+	else
+		fLog -n "$(colored "34" "[ INFORMATION ]") Local repository and resources in GitLab figures vary. Updating remote repository."
+		fLog "$(colored "34" "[ INFORMATION ]") Local repository checksum: $(git rev-parse @{u})"
+		fLog "$(colored "34" "[ INFORMATION ]") Remote repository checksum: $(git rev-parse HEAD)"
+		git pull; CODE=$?
+		if [ ${CODE} -ne 0 ]; then
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Errors during updating local repository (problem with PULL command)"
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Problems causing repositories merge problems should be resolved manually"
+			stop_deployment "Errors during updating local repository"
+		fi
+
+	fi
+
+	if [ -n "$(git status --porcelain)" ]; then
+		fLog "$(colored "32" "[ INFORMATION ]") Configuration files were changed. Merging to GitLab"
+		git add *
+		git commit -a -m "Server configuration - ${VERSION} `date +[%m-%d][%R]`"
+		git push; CODE=$?
+		if [ ${CODE} -ne 0 ]; then
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Errors during updating local repository (problem with PUSH command)"
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Problems causing repositories merge problems should be resolved manually"
+			stop_deployment "Errors during updating local repository"
+		fi
+
+		if [[ `git rev-parse -q --verify "refs/tags/${VERSION}"` ]]; then
+			fLog "Updating current tag in GitLab repository"
+			git tag -d ${VERSION}
+			git push origin :refs/tags/${VERSION}
+		fi
+
+		fLog "Creating new tag in GitLab repository"
+		git tag ${VERSION}
+		git push origin ${VERSION}
+	else
+		fLog -n "$(colored "32" "[ INFORMATION ]") Local repository does not changed - skipping merge process to Git repository"
+	fi
+}
+
+function push_to_gitlab() {
+	mkdir -p ${LHOME}/${PROJECT}/bin/environments_configuration/{common,${ENV}} # create required directories
+	run_remote_command ${HOST} "mkdir -p ${TEMP_DIR}/${VERSION}/common ${ARCH_CONF}"
+
+	DELIVERED_CONF_FILE=$(date -d`less ${ZIP_FILE} | grep common/properties_config.xml 2>/dev/null | awk '{print $4}'` +%s 2>/dev/null)
+	REPO_CONF_FILE=$(date -d`stat -c %y ${LHOME}/${PROJECT}/bin/environments_configuration/common/properties_config.xml 2>/dev/null | awk '{print $1}'` +%s 2>/dev/null)
+
+	cd ${LHOME}/${PROJECT}/bin/environments_configuration # directory where configuration files are stored
+	if [[ `grep -P "(?=^ZK_GIT)(?=.*${ENV}_UPLOAD)" ${SERVERS_ARR_FILE}` ]]; then
+		if [[ -z ${DELIVERED_CONF_FILE} ]]; then
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Server configuration files were not delivered with package"
+			stop_deployment "Server configuration files were not delivered with package"
+		else
+			fLog -n "Updating configuration repository for ${ENV} environment (detected ${ENV}_UPLOAD key in servers.arr file)"
+			if [[ `tar -tf ${ZIP_FILE} | grep "${ENV}/values.properties\|${ENV}/clients_config.xml\|common/properties_config.xml" | wc -l` -eq 3 ]]; then
+				[[ ${DELIVERED_CONF_FILE} -ne ${REPO_CONF_FILE} ]] && \
+				tar -zxf ${ZIP_FILE} -C . common || \
+				fLog -n "$(colored "31" "[ WARNING ]") Skipping extracting process for properties_config.xml file - version exists in GIT repository"
+
+				# extract environment configuration, but prevent extracting properties_config.xml in case of newer releases already deployed on environments
+				tar -zxf ${ZIP_FILE} -C . ${ENV}
+				update_repository
+			else
+				fLog -n "$(colored "31" "[ WARNING ]") Configuration files were not delivered entirely with package"
+				if [[ `tar -tf ${ZIP_FILE} | grep "common/properties_config.xml" | wc -l` -eq 1 ]]; then
+					tar -zxf ${ZIP_FILE} --strip-components=1 -C common/ common/properties_config.xml # extract properties_config.xml to existing common folder (strip head folder)
+					update_repository
+					fLog "$(colored "31" "[ WARNING ]") Will be used files from the last deployment"
+				else
+					fLog -n "$(colored "31" "[ CRITICAL ERROR ]") Configuration files were not delivered. Aborting deployment."
+					stop_deployment "ZooKeeper configuration files were not delivered with package"
+				fi
+			fi
+		fi
+	elif [[ `grep ^UPDATE_ZOOKEEPER_REPOSITORY ${SERVERS_ARR_FILE} | grep ${ENV}` ]]; then
+		# situation, when configuration files are taken care by implementation team and definition comes from production
+		fLog "Processing package synchronisation with delivered release (implementation part - properties_config.xml file)"
+		
+		if [[ -z ${DELIVERED_CONF_FILE} ]]; then
+			fLog -n "$(colored "31" "[ WARNING ]") File properties_config.xml was not delivered with package"
+			fLog "$(colored "31" "[ WARNING ]") This may cause unavailablity of some keys declared in values.properties"
+		elif [[ ${DELIVERED_CONF_FILE} -ne ${REPO_CONF_FILE} ]]; then
+			tar -zxf ${ZIP_FILE} --strip-components=1 -C common/ common/properties_config.xml
+			fLog "$(colored "32" "[ INFORMATION ]") Updating mandatory properties_config.xml file"
+		else
+			fLog -n "$(colored "31" "[ WARNING ]") Skipping extracting process for properties_config.xml file - version exists in GIT repository"
+		fi
+		update_repository # update repository - not only delivered files, but also implementation part (section excluded outside from below conditions)
+	fi
+
+	if [[ ${VARIABLE} = '--update' ]]; then
+		tar -cf ${ENV}_UPDATE_CentralConfigurationServerFiles.tar -C ${ENV}/ .
+		tar -rf ${ENV}_UPDATE_CentralConfigurationServerFiles.tar -C common/ .
+		RESULT=$(scp -pq ${ENV}_UPDATE_CentralConfigurationServerFiles.tar ${USER}@${HOST}:${TEMP_DIR})
+		CODE=$?; check_errors
+		run_remote_command ${HOST} "cd ${TEMP_DIR}; tar -xf ${ENV}_UPDATE_CentralConfigurationServerFiles.tar -C ${DEST_DIR}"
+	fi
+}
+
+function copy_to_server() {
+	fLog -n "$(colored "34" "[ INFORMATION ]") Copying Configuration Server Files for ${ENV} environment"
+	fLog "File: `basename $@`"
+	fLog "Destination directory: ${TEMP_DIR}"
+	RESULT=$(scp -pq $@ ${USER}@${HOST}:${TEMP_DIR} 2>&1)
+	CODE=$?; check_errors
+	fLog "$(colored "32" "[ INFORMATION ]") Server Configuration Files were copied successfully"
+}
+
+function check_ZK_configuration() {
+	fLog "Archiving ZooKeeper configuration files"
+	run_remote_command ${HOST} "cd ${ARCH_CONF}; tar -zcf $(date +'%s')_Configuration.tar.gz -C ${DEST_DIR} ." # cannot use colon because of errors related to 'tar' command
+
+	cd ${CRM_DIR}
+	# download configuration files for environment (check if configuration for specific environment is present in repository)
+	RESULT=$(git archive --format tar.gz -o ./${ENV}_CentralConfigurationServerFiles.tar.gz --remote=git@`grep ^GIT_ZOOKEEPER_REMOTE ${SERVERS_ARR_FILE} | awk '{print $2}'` `eval echo ${ZK_BRANCH}` ${ZK_CUSTOM_FOLDER} &>/dev/null); CODE=$?
+
+	if [ ${CODE} -ne 0 ] || [[ ! `grep -P "(?=^ZK_GIT)(?=.*${ENV}_DOWNLOAD)" ${SERVERS_ARR_FILE}` ]]; then # in order to exclude environments from downloading repository files from GitLab
+		fLog "Configuration Server Files - there is no version to download from GIT"
+		rm -f ${ENV}_CentralConfigurationServerFiles.tar.gz
+		if [ `tar -tf CentralConfigurationServerFiles*.tar.gz | grep "${ENV}/values.properties\|${ENV}/clients_config.xml\|common/properties_config.xml" | wc -l` -ne 3 ]; then
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Configuration Server Files - not delivered. Aborting deployment."
+			stop_deployment "Configuration Server Files - not delivered"
+		else
+			copy_to_server "${ZIP_FILE}" # copy configuration server files
+
+			fLog "Extracting Configuration Server Files"
+			run_remote_command ${HOST} "tar -zxmf ${TEMP_DIR}/`basename ${ZIP_FILE}` -C ${TEMP_DIR}/${VERSION}" # suppress extract file modified time message (file in the future - switch 'm')
+			fLog "Configuration Server Files were extracted successfully"
+		fi
+	elif [ ${CODE} -eq 0 ]; then
+		fLog "$(colored "32" "[ INFORMATION ]") Configuration Server Files - successfully downloaded from Git"
+
+		MERGE_ZK_CONFIG=$(grep ^ZK_MERGE ${SERVERS_ARR_FILE} | awk '{print $4}')
+		if [[ ${MERGE_ZK_CONFIG} == 'MERGE_TRUE' ]]; then
+			fLog "$(colored "32" "[ INFORMATION ]") Merging implementation configuration files with part delivered in package ( properties_config.xml file )"
+			tar -zxf ${ZIP_FILE} common/properties_config.xml
+			rm -f ${ENV}_CentralConfigurationServerFiles.tar
+			gunzip ${ENV}_CentralConfigurationServerFiles.tar.gz
+			tar -rf ${ENV}_CentralConfigurationServerFiles.tar common/properties_config.xml
+			gzip ${ENV}_CentralConfigurationServerFiles.tar
+		fi
+
+		if [ ${CODE} -eq 0 ]; then
+			COUNT_FILES=`tar -tf ${CRM_DIR}/${ENV}_CentralConfigurationServerFiles.tar.gz | grep "${ENV}/clients_config.xml\|common/properties_config.xml\|${ENV}/values.properties" | wc -l`
+			if ! [ ${COUNT_FILES} == 3 ]; then
+				fLog "$(colored "31" "[ CRITICAL ERROR ]") Configuration Server package doesn't contain all required files. Aborting deployment."
+				stop_deployment "Configuration Server package doesn't contain all required files"
+			fi
+
+			copy_to_server "${ENV}_CentralConfigurationServerFiles.tar.gz" # copy configuration server files
+			
+			fLog "Extracting Configuration Server Files"
+			# count how many folders have to be stripped to ensure the same structure for all projects
+			COUNT_SLASHES=$((`tar -tf ${ENV}_CentralConfigurationServerFiles.tar.gz | grep properties_config.xml | grep -o '/' | wc -l`-1))
+			run_remote_command ${HOST} "cd ${TEMP_DIR}; tar -zxmf ${ENV}_CentralConfigurationServerFiles.tar.gz -C ./${VERSION} --strip-components=${COUNT_SLASHES}"
+			fLog "Configuration Server Files copied successfully"
+		else
+			fLog -n "$(colored "31" "[ CRITICAL ERROR ]") Server configuration failed to download from Git repository. Aborting deployment."
+			stop_deployment "Server configuration failed to download from Git repository"
+		fi
+	fi
+}
+
+function change_ZK_configuration_files() {
+	# update configuration paths for AIF, BPC, BSS, CRM (logic, presentation, bpm, esb), TUM in properties_config.xml
+	fLog "$(colored "32" "[ INFORMATION ]") Detected 'HOT_DEPLOY' configuration option. Processing applications configuration."
+	run_remote_command ${HOST} "cp ${TEMP_DIR}/${VERSION}/common/properties_config.xml ${TEMP_DIR}/${VERSION}/common/properties_config.xml.bak" # create backup of properties_config.xml file
+
+	[[ ! `grep -P "^(?=.*AIF_copyextract)(?=.*skipping)" ${STEPS_FILE}` ]] && \
+	run_remote_command ${HOST} "sed -i \"s|current/etc|`grep ^HOT_DEPLOY ${SERVERS_ARR_FILE} | awk '{print $6}'`/etc|g\" ${TEMP_DIR}/${VERSION}/common/properties_config.xml"
+	
+	[[ ! `grep -P "^(?=.*BPC_copyextract)(?=.*skipping)" ${STEPS_FILE}` ]] && {
+		run_remote_command ${HOST} "sed -i \"s|bpc-rest-api/current|bpc-rest-api/`grep ^HOT_DEPLOY ${SERVERS_ARR_FILE} | awk '{print $5}'`|g\" ${TEMP_DIR}/${VERSION}/common/properties_config.xml"
+		run_remote_command ${HOST} "sed -i \"s|bpc-loader/current|bpc-loader/`grep ^HOT_DEPLOY ${SERVERS_ARR_FILE} | awk '{print $5}'`|g\" ${TEMP_DIR}/${VERSION}/common/properties_config.xml"
+	}
+
+	[[ ! `grep -P "^(?=.*BSS_copyextract)(?=.*skipping)" ${STEPS_FILE}` ]] && \
+	run_remote_command ${HOST} "sed -i \"s|servers/launcher/current|servers/launcher/$(grep ^HOT_DEPLOY ${SERVERS_ARR_FILE} | awk '{print $2}')|g\" ${TEMP_DIR}/${VERSION}/common/properties_config.xml"
+	
+	[[ ! `grep -P "^(?=.*CRM_copyextract)(?=.*skipping)" ${STEPS_FILE}` ]] && {
+		run_remote_command ${HOST} "sed -i \"s|servers/presentation|`grep ^HOT_DEPLOY ${SERVERS_ARR_FILE} | awk '{print $3}'`/presentation|g\" ${TEMP_DIR}/${VERSION}/common/properties_config.xml"
+		run_remote_command ${HOST} "sed -i \"s|servers/logic/server|`grep ^HOT_DEPLOY ${SERVERS_ARR_FILE} | awk '{print $3}'`/logic/server|g\" ${TEMP_DIR}/${VERSION}/common/properties_config.xml"
+		run_remote_command ${HOST} "sed -i \"s|servers/logic/bin|`grep ^HOT_DEPLOY ${SERVERS_ARR_FILE} | awk '{print $3}'`/logic/bin|g\" ${TEMP_DIR}/${VERSION}/common/properties_config.xml"
+		run_remote_command ${HOST} "sed -i \"s|servers/bpm/server|`grep ^HOT_DEPLOY ${SERVERS_ARR_FILE} | awk '{print $3}'`/bpm/server|g\" ${TEMP_DIR}/${VERSION}/common/properties_config.xml"
+		run_remote_command ${HOST} "sed -i \"s|servers/esb/server|`grep ^HOT_DEPLOY ${SERVERS_ARR_FILE} | awk '{print $3}'`/esb/server|g\" ${TEMP_DIR}/${VERSION}/common/properties_config.xml"
+		run_remote_command ${HOST} "sed -i \"s|servers/esb/bin|`grep ^HOT_DEPLOY ${SERVERS_ARR_FILE} | awk '{print $3}'`/esb/bin|g\" ${TEMP_DIR}/${VERSION}/common/properties_config.xml"
+	}
+
+	[[ ! `grep -P "^(?=.*TUM_copyextract)(?=.*skipping)" ${STEPS_FILE}` ]] && \
+	run_remote_command ${HOST} "sed -i \"s|tum-restapi|`grep ^HOT_DEPLOY ${SERVERS_ARR_FILE} | awk '{print $4}'`|g\" ${TEMP_DIR}/${VERSION}/common/properties_config.xml"
+}
+
+function install_configuration_changes() {
+	fLog "Validation of values.properties configuration file"
+	RESULT=$(run_remote_command ${HOST} -n "grep ^[a-zA-Z] ${DIRECTORY}/values.properties | grep [[:blank:]]$")
+	if [[ $? -eq 0 ]]; then
+		fLog "$(colored "31" "[ CRITICAL ERROR ]") Errors were found in configuration keys (redundant spaces at the end)"
+		run_remote_command ${HOST} "grep ^[a-zA-Z] ${DIRECTORY}/values.properties | grep [[:blank:]]$" | sed 1,4d # remove first four lines of output
+		stop_deployment "Errors were found in configuration keys (redundant spaces at the end)"
+	else
+		fLog -n "$(colored "32" "[ CONFIRMATION ]") Validation of environment's configuration files completed successfully"
+	fi
+
+	FILES="${DIRECTORY}/../common/properties_config.xml ${DIRECTORY}/values.properties ${DIRECTORY}/clients_config.xml"
+	[[ `grep ^${ENV}_CONFIGURATION ${SERVERS_ARR_FILE} | awk '{print $3}'` == 'HOT_DEPLOY' ]] && change_ZK_configuration_files # change properties.config values if HOT_DEPLOY is enabled
+	INITIAL_DATE=$(run_remote_command ${HOST} "date -d\"`date +"%F %H:%M:%S"`\" +%s" | tail -n1) # get time before shuttling file
+	
+	fLog "Shuttling files for ZooKeeper (waiting 120s for proper configuration propagation)"
+	RESULT=$(run_remote_command ${HOST} -n "mv ${FILES} ${DEST_DIR}")
+	if [[ $? -ne 0 ]]; then
+		fLog "$(colored "31" "[ CRITICAL ERROR ]") Delivered ZooKeeper configuration files have incorrect structure"
+		stop_deployment "Delivered ZooKeeper configuration files have incorrect structure"
+	fi
+
+	run_remote_command ${HOST} "touch ${DEST_DIR}/values.properties"
+	sleep 120 # wait for changes propagation
+	fLog "ZooKeeper configuration files (clients_config.xml, properties_config.xml and values.properties) were shuttled successfully"
+}
+
+function check_configuration() {
+	# check the status of ZK components
+	function ZK_WORKING_TEST() { USER=${CRM_USER}; run_remote_command ${CRM_HOST} "zk_manage all status ${ENV} | grep is\ responding | wc -l" | tail -n1; }
+	# update configuration file when clinet has to be restarted
+	function TOUCH_VALUES() { CRM_SERVER=(`grep CRM ${SERVERS_ARR_FILE} | grep ${ENV} | grep -w '1'`); local USER="${CRM_SERVER[4]}"; run_remote_command ${CRM_SERVER[2]} "touch ${DEST_DIR}/values.properties"; }
+	# verify znodes reposnse from ZooKeeper console - folder /states
+	function CHECK_ZNODE_RESPONSE() {
+		local USER=${CRM_USER}
+		RESULT=$(run_remote_command ${CRM_HOST} -n "${CRM_RHOME}/config_management/zk-server-1/bin/zkCli.sh get /states/${ZNODE_NAME} 2>&1 | grep 'Node does not exist'")
+		return $?
+	}
+
+	CRM_USER=${USER}; CRM_HOST=${HOST}; CRM_RHOME=${SERV[5]} # initial values for main CRM host (variables are overwritten during loop)
+
+	fLog "\nRestarting ZooKeeper server to refresh connected clients"
+	run_remote_command ${HOST} "zk_manage server restart ${ENV}"
+	CHECK_ZK_SERVER=$(run_remote_command ${HOST} -n "[[ \`zk_manage server status ${ENV} | grep is\ responding | wc -l\` -eq 1 ]]") # check if ZK server is working
+	if [ "$?" != "0" ]; then
+		fLog "$(colored "31" "[ CRITICAL ERROR ]") ZooKeeper server is not working correctly"
+		fLog "$(colored "31" "[ CRITICAL ERROR ]") Application logfiles: ${CRM_RHOME}/config_management/logs"
+		stop_deployment "ZooKeeper server is not working correctly"
+	else
+		fLog -n "$(colored "32" "[ CONFIRMATION ]") ZooKeeper server is running. Processing configuration deployment."
+	fi
+
+	RESULT=$(run_remote_command ${HOST} -n "which nmap")
+	if [[ $? -eq 0 ]]; then
+		fLog "\nVeryfing TCP connection between znodes and ZooKeeper server"
+		ZK_SERVER_PORT=$(run_remote_command ${HOST} "grep ^clientPort \"${RHOME}/config_management/zk-server-1/conf/zoo.cfg\" | cut -d'=' -f2" | sed 1,4d) # get ZooKeeper's server default port
+		for SERVER in "${SERVERS_ARRAY[@]}"; do
+			SERV=($SERVER)
+			if [[ "${SERV[0]}" = "${ENV}" ]] && [[ "${SERV[1]}" =~ ^(CPM|AIF|BPC|TUM|CRM)$ ]]; then
+				HOST_CHECK="${SERV[2]}"; USER="${SERV[4]}"
+
+				NMAP_STATUS=$(run_remote_command ${HOST_CHECK} -n "nmap ${HOST} -p 2181 2>&1 | grep ^${ZK_SERVER_PORT} | awk "'"{print \$2}"'"" | sed 1,4d)
+				if [[ ${NMAP_STATUS} == 'open' ]]; then
+					fLog "$(colored "32" "[ CONFIRMATION ]") TCP connection from ${USER}@${HOST_CHECK} host to crm@${HOST} host on ${ZK_SERVER_PORT} port is open"
+				else
+					fLog "$(colored "31" "[ CRITICAL ERROR ]") TCP connection from ${USER}@${HOST_CHECK} host to crm@${HOST} host on ${ZK_SERVER_PORT} port is closed"
+					stop_deployment "TCP connection from ${USER}@${HOST_CHECK} host to crm@${HOST} host on ${ZK_SERVER_PORT} port is closed"
+				fi
+			fi
+		done
+	else
+		fLog -n "\n$(colored "31" "[ WARNING ]") Linux NMAP command is unavailable. Skipping TCP connection verification with ZooKeeper server"
+	fi
+
+	fLog "\nVeryfing ZooKeeper's components responsiveness: client, supervisor and watcher"
+	if [[ `ZK_WORKING_TEST` -ne 4 ]]; then
+		fLog "$(colored "31" "[ WARNING ]") ZooKeeper didn't start properly (client, file-watcher or supervisor). Restarting."
+		USER=${CRM_USER}; run_remote_command ${CRM_HOST} "zk_manage components restart ${ENV}" # built-in error validation
+	else
+		fLog -n "$(colored "32" "[ CONFIRMATION ]") ZooKeeper: client, file-watcher and supervisor are running. Processing configuration deployment."
+	fi
+
+	fLog "\nVeryfing ZooKeeper's znodes activities"
+	for ZNODES in `grep ^${ENV}_ZNODES ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`; do
+		ZNODE_ADDRESS="${ZNODES#*:}"; ZNODE_NAME="${ZNODES%:*}"; USER="${ZNODE_ADDRESS%@*}"; ZNODE_HOST="${ZNODE_ADDRESS#*@}"
+
+		CHECK_ZNODE_RESPONSE
+		if [ "$?" -ne "1" ]; then
+			fLog "$(colored "31" "[ WARNING ]") Client on node ${ZNODE_HOST} (znode name: ${ZNODE_NAME}) is not accessible. Restarting."
+			run_remote_command ${ZNODE_HOST} "zk_manage client restart ${ENV}"
+			ZNODE_RESPONSE_ERROR=1
+			CHECK_ZNODE_RESPONSE
+			if [ "$?" -ne "1" ]; then
+				fLog "$(colored "31" "[ CRITICAL ERROR ]") Node does not exist in ZooKeeper's CLI (directory /states/${ZNODE_NAME})"
+				fLog "$(colored "31" "[ CRITICAL ERROR ]") Configuration has to be checked (key: ${ENV}_ZNODES in servers.arr) and client directly"
+				stop_deployment "Node does not exist in ZooKeeper's CLI (directory /states/${ZNODE_NAME}"
+			else
+				fLog -n "$(colored "32" "[ CONFIRMATION ]") Client on node ${ZNODE_HOST} (znode name: ${ZNODE_NAME}) is working correctly"
+			fi
+		else
+			fLog -n "$(colored "32" "[ CONFIRMATION ]") Client on node ${ZNODE_HOST} (znode name: ${ZNODE_NAME}) is working correctly"
+		fi
+	done
+
+	USER=${CRM_USER}; HOST=${CRM_HOST}; HOME=${CRM_RHOME} # initial values for main CRM host (variables are overwritten during loop)
+	# in some cases, not responding ZooKeeper clients after restarting are not correctly propagating changes (they are not accessible from zkCli.sh console)
+	if [[ ${ZNODE_RESPONSE_ERROR} -eq 1 ]]; then
+		fLog "\n$(colored "31" "[ WARNING ]") Detected, that some znodes reported status problems (restart was required)"
+		fLog "$(colored "31" "[ WARNING ]") Restarting ZooKeeper core components to prevent configuration changes propagation omission"
+		run_remote_command ${HOST} "zk_manage core restart ${ENV}"
+	fi
+
+	fLog "\nValidation of configuration propagation for applications"
+	for ZNODES in `grep ^${ENV}_ZNODES ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`; do
+		ZNODE_ADDRESS=${ZNODES#*:}; ZNODE_NAME=${ZNODES%:*}
+		RESULT=$(date -d "`run_remote_command ${HOST} "${CRM_RHOME}/config_management/zk-server-1/bin/zkCli.sh get /states/${ZNODE_NAME} 2>&1 | grep mtime" | tail -n1 | sed 's|mtime = ||g'`" +"%s" 2>/dev/null)
+
+		if [[ $? -ne 0 ]]; then
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Gathering modification time on ${ZNODE_NAME} znode finished with critical error (configuration should be checked manually)"
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Znodes are listed in servers.arr configuration file (ZooKeeper's watcher should be restarted, if client's name was changed)"
+			stop_deployment "Gathering modification time on ${ZNODE_NAME} znode finished with critical error"
+		elif [[ $INITIAL_DATE -gt $RESULT ]]; then
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Modification time on ${ZNODE_NAME} znode (`date -d @$RESULT`) is older than required (`date -d @$INITIAL_DATE`)"
+			stop_deployment "Modification time on ${ZNODE_NAME} znode (`date -d @$RESULT`) is older than required (`date -d @$INITIAL_DATE`)"
+		else
+			USER=${CRM_USER}; RESULT=$(run_remote_command ${CRM_HOST} -n "${CRM_RHOME}/config_management/zk-server-1/bin/zkCli.sh get /states/${ZNODE_NAME} 2>&1 | grep \"<error>\""); CODE=$?
+			if [[ ${CODE} -eq 0 ]]; then
+				fLog "$(colored "31" "[ CRITICAL ERROR ]") Configuration propagation on ${ZNODE_NAME} znode finished with errors and requires user attention"
+				fLog "$(colored "31" "[ CRITICAL ERROR ]") Failed on saving configuration to files (errors should be checked and solved manually)"
+				run_remote_command ${CRM_HOST} "${CRM_RHOME}/config_management/zk-server-1/bin/zkCli.sh get /states/${ZNODE_NAME} 2>&1 | grep \"<error>\"" | sed 1,4d | \
+				while read LINE; do fLog "$(colored "31" "[ CRITICAL ERROR ]") [ FILE ] `echo ${LINE%. Error log*} | sed 's|.*file: ||g'`"; done
+				stop_deployment "Configuration propagation on ${ZNODE_NAME} znode finished with errors"
+			else
+				fLog -n "$(colored "32" "[ CONFIRMATION ]") Configuration propagation on ${ZNODE_NAME} znode finished successfully"
+			fi
+		fi
+	done
+	fLog "\n$(colored "32" "[ INFORMATION ]") Configuration updates were applied successfully. Processing deployment."
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+echo -e "$(colored "34" "[ INFORMATION ]") Updating required configuration and management scripts. Please wait."
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+	SERV=($SERVER)
+	if [[ "${SERV[0]}" = "${ENV}" ]] && [[ "${SERV[1]}" =~ ^(CRM|CPM|BPC|TUM|AIF)$ ]]; then # execute on all CRM and CPM nodes
+		HOST="${SERV[2]}"; USER="${SERV[4]}"
+		copy_ZK_manage_script &>/dev/null # update management scripts (zk_manage, location_finder, servers.arr)
+	fi
+done
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+	SERV=($SERVER)
+	if [[ "${SERV[0]}" = "${ENV}" ]] && [[ "${SERV[1]}" = "CRM" ]] && [[ "${SERV[3]}" = "1" ]]; then # execute only on main CRM node
+		HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+		push_to_gitlab
+		[[ -z ${VARIABLE} ]] && { check_ZK_configuration; install_configuration_changes; }
+		check_configuration
+		break
+	fi
+done
+
+#--------------------------------------------------------------------#
+#------------------------- POST EXECUTION ---------------------------#
+#--------------------------------------------------------------------#
+
+if [[ `grep ^PROTECTED_ENVIRONMENTS ${SERVERS_ARR_FILE} | grep ${ENV}` ]]; then
+	echo -e "\n$(colored "34" "[ INFORMATION ]") Performing post execution tasks. Please wait."
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		if [[ "${SERV[0]}" == "${ENV^^}" ]]; then
+			HOST="${SERV[2]}"; USER="${SERV[4]}"
+			ssh -qo BatchMode=yes ${USER}@${HOST} "bash -l -c 'find ~/bin -maxdepth 1 -type f -name \"zk_manage\" -exec rm {} \;'" &>/dev/null # remove decrypted files from all nodes
+		fi
+	done
+fi
+
+source ${BIN_PATH}/common_after

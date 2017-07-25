@@ -1,0 +1,344 @@
+#!/bin/bash -
+# RabbitMQ management tool by adam.chalat@comarch.com
+# supporting features: counting messages queues, checking cluster health in high availability mode
+# acceptable switches: --performance, --counter
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="18.07.2017r."
+SCRIPT_VERSION="0.1.21"
+
+PID_FILE=~/bin/PID_files/$(basename $0).pid
+trap "rm -f -- '$PID_FILE'" EXIT # remove PID file on exit
+
+CURRENT_USER=${USER}
+source ~/bin/location_finder
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nRabbitMQ management tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [server]: all"
+	echo "Available parameter [task]: start, stop, restart, status"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	echo -e "Available parameter [options]: --current (queued messages counter), --performance (cluster monitoring)\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [server] [task] [environment] [options]")\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- PARAMETERS -------------------------------#
+#--------------------------------------------------------------------#
+
+SERVER_NAME=${1,,}
+JOB=${2,,}
+ENV_NAME=${3^^}
+CUR_NAME=${4,,}
+
+PARENT_PID=$$
+NOERROR=`echo "${@: -1}"` # avoid getting errors, when using server_manage (--noerror)
+ERROR_QUEUES=0; CLUSTER_ERROR=0 # reset to original state
+
+[[ $(echo "$@" | grep -w '\-\-performance') ]] && PERFORMANCE_FLAG=TRUE || PERFORMANCE_FLAG=FALSE
+[[ $(echo "$@" | grep -w '\-\-counter') ]] && COUNTER_FLAG=TRUE || COUNTER_FLAG=FALSE # used during deployment to provide validation of BSS SUITE components using RabbitMQ stack
+TRANSPORT_PORT=$(grep ^${SHOW_ENV_NAME}_RABBIT_NODES ~/bin/servers.arr | grep -oE "${IP_ADDRESS}.*" | awk '{print $1}' | awk -F":" '{print $2}')
+
+#--------------------------------------------------------------------#
+#----------------------------- PATH ---------------------------------#
+#--------------------------------------------------------------------#
+
+# RabbitMQ default homedir is different for various projects
+for LOCATION in ${SHOW_DEFAULT_PATH} ${SHOW_DEFAULT_PATH}/servers; do
+	[[ -f ${LOCATION}/rabbitmq/rabbitmq.sh ]] && { RMQ_HOME=${LOCATION}/rabbitmq; break; }
+done
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rmq_manage
+
+RMQ_USER=$(grep default_user ${RMQ_HOME}/rabbitmq.config | sed 's/">>.*//' | sed 's/.*<<"//g' | tail -n1)
+RMQ_PASSWORD=$(grep default_pass ${RMQ_HOME}/rabbitmq.config | sed 's/">>.*//' | sed 's/.*<<"//g' | tail -n1)
+PORT=$(grep rabbitmq_management ${RMQ_HOME}/rabbitmq.config | sed 's/}.*//' | sed 's/.*, //g' | tail -n1)
+
+#--------------------------------------------------------------------#
+#----------------------- CHECK PARAMETERS ---------------------------#
+#--------------------------------------------------------------------#
+
+declare -a SERVER_NAME_ARR=("all")
+declare -a JOB_ARR=("start" "stop" "restart" "status")
+
+if [[ -z $(echo "${SERVER_NAME_ARR[@]:0}" | grep -w ${SERVER_NAME}) ]]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong parameter. Please see below"
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Available parameters [server]: all\n"
+	exit 1
+elif [[ -z $(echo "${JOB_ARR[@]:0}" | grep -w $JOB) ]]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong parameter. Please see below."
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Available parameters [task]: start, stop, restart, status\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------ RESTARTING FUNCTION -----------------------#
+#--------------------------------------------------------------------#
+
+function STOP_PROCESSES() {
+	echo -e "\n$(colored "34" "[ INFORMATION ]") Stopping RabbitMQ server and erlang processes on ${IP_ADDRESS} ( ${HOSTNAME} )"
+	${RMQ_HOME}/rabbitmq.sh stop
+
+	RESULT_ERLANG=$(ps -fu ${USER} | grep erlang | grep daemon | grep -v grep | awk '{printf "%s ", $2}')
+	RESULT_SERVER=$(ps -fu ${USER} | grep rabbitmq_server | grep -v grep | awk '{printf "%s ", $2}')
+
+	[[ ${RESULT_ERLANG} ]] && { echo "Killing additional erlang processes"; kill -9 ${RESULT_ERLANG}; }
+	[[ ${RESULT_SERVER} ]] && { echo "Killing additional RabbitMQ server instances"; kill -9 ${RESULT_SERVER}; }
+}
+
+#--------------------------------------------------------------------#
+#------------------------- STARTING FUNCTION ------------------------#
+#--------------------------------------------------------------------#
+
+function START_PROCESSES() {
+	echo -e "\n$(colored "34" "[ INFORMATION ]") Starting RabbitMQ server and erlang processes on ${IP_ADDRESS} ( ${HOSTNAME} )"
+	${RMQ_HOME}/rabbitmq.sh start
+}
+
+#--------------------------------------------------------------------#
+#------------------------- STATUS FUNCTION --------------------------#
+#--------------------------------------------------------------------#
+
+function get_process_parameters() {
+	stime=`ps -p $1 -o lstart= | awk '{print $2 $3}'` # start day
+	upwork=`ps -p $1 -o lstart= | awk '{print $4}'` # start time
+	cpu=`ps -p $1 -o %cpu= | awk '{print $1}'` # cpu load
+	memory=`ps -p $1 -o %mem= | awk '{print $1}'` # memory load
+	echo -e "PID: [ $(colored "35" "$(printf "%5d" $1)") ] Stime: [ $(colored "36" "$stime") $(colored "36" "$upwork") ]" \
+	"CPU: [ $(colored "31" "$(printf "%4s" $cpu)") ] PMEM: [ $(colored "33" "$(printf "%4s" $memory)") ] $2 $(colored "32" "is responding")"
+}
+
+function STATUS_PROCESSES() {
+	echo -e "\n$(colored "34" "Testing RabbitMQ server and erlang processes on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+
+	RESULT_ERLANG=$(ps -fu ${USER} | grep -v grep | grep -P '(?=.*?erlang)(?=.*?daemon)' | awk '{printf "%s ", $2}')
+	if ${RMQ_HOME}/rabbitmq.sh ctl status 2>&1 | grep -q 'nodedown'; then
+		if [[ ${RESULT_ERLANG} ]]; then
+			echo -e "\nRabbitMQ server is $(colored "31" "not working"), but there are still working erlang daemons with PIDs: $(colored "34" "${RESULT_ERLANG}")"
+			echo -e "$(colored "31" "Killing additional erlang processes")"
+			kill -9 ${RESULT_ERLANG}
+		else
+			echo -e "\nRabbitMQ server and erlang daemons are $(colored "31" "not working")"
+		fi
+	else
+		if ${RMQ_HOME}/rabbitmq.sh ctl status 2>&1 | grep -q 'Crash dump'; then
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") RabbitMQ server reported kernel failure. Stack was written to erl_crash.dump."
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") Please contact ITOPS department."
+			exit 1
+		else
+			RESULT_SERVER=$(${RMQ_HOME}/rabbitmq.sh ctl status 2>&1 | grep '\[{pid' | sed 's/[^0-9]*//g')
+			get_process_parameters "${RESULT_SERVER}" "RabbitMQ server"
+			if [[ `echo ${RESULT_ERLANG} | wc -w` -ne 1 ]]; then
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") There are working more than one erlang processes: ${RESULT_ERLANG}"
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") Processes which are not redundant should be turned off"
+				exit 1
+			else
+				get_process_parameters "${RESULT_ERLANG}" "Erlang daemon process"
+
+				[[ ${PERFORMANCE_FLAG} == 'TRUE' ]] && {
+					LIST_CONNECTIONS=$(ss -nt dport = :${TRANSPORT_PORT} | sed 1d | awk '{print $4}' | awk -F":" '{print $4 ":" $5}' | pr -3t) # default 5672 transport RabbitMQ port and remove header line of output
+					[[ -z ${LIST_CONNECTIONS} ]] && \
+					{ echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") There are no sockets with destination ${TRANSPORT_PORT} port (applications using AMQP service should be veryfied)"; ERROR_QUEUES=1; } || {
+						echo -e "\n$(colored "32" "[ INFORMATION ]") Sockets with destination ${TRANSPORT_PORT} port (RabbitMQ node port)"
+						echo "${LIST_CONNECTIONS}"
+
+						SOURCE_CONNECTIONS=$(ss -nt sport = :${TRANSPORT_PORT} | sed 1d | awk '{print $5}' | awk -F":" '{print $4 ":" $5}' | pr -3t)
+						[[ -z ${LIST_CONNECTIONS} ]] && \
+						{ echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") There are no sockets sourced by ${TRANSPORT_PORT} port (BSS SUITE applications should be veryfied)"; ERROR_QUEUES=1; } || \
+						{ echo -e "\n$(colored "32" "[ INFORMATION ]") Sockets sourced by ${TRANSPORT_PORT} port (RabbitMQ node port)"; echo "${SOURCE_CONNECTIONS}"; }
+					}
+				}
+
+				echo -e "\n$(colored "34" "[ INFORMATION ]") Performing queues counting process on ${IP_ADDRESS} ( ${HOSTNAME} )"
+				# while loop in Bash creates a subshell (when the subshell exits, all variables return to their previous values)
+				COUNT_QUEUES=0; COUNT_MESSAGES=0
+				while read line; do
+					if [[ `echo $line | awk '{print $2}' | sed 's|[^0-9]*||g'` -gt 0 ]]; then
+						CURL_RESPONSE=$(curl --user ${RMQ_USER}:${RMQ_PASSWORD} -XGET -s http://${IP_ADDRESS}:${PORT}/api/queues/%2F/`awk '{print $1}' <<< $line`)
+						QUEUE_CONSUMER=$(grep -Po '"consumers":.*?,' <<< ${CURL_RESPONSE} | sed 's|[^0-9]*||g')
+						QUEUE_RATE_READY=$(grep -Po '"publish_details":.*?,' <<< ${CURL_RESPONSE} | head -n1 | sed 's|.*:||g' | awk -F"}" '{print $1}')
+						COUNT_MESSAGES=$((COUNT_MESSAGES + `echo $line | awk '{print $2}'`))
+
+						COUNT_QUEUES=$(expr ${COUNT_QUEUES} + 1)
+						[[ ${QUEUE_CONSUMER} -eq 0 ]] && {
+							COUNT_QUEUES_ERROR=$(expr ${COUNT_QUEUES_ERROR} + 1)
+							echo -e "$(colored "31" "[ QUEUE ${COUNT_QUEUES} ]") `awk '{print $1, "has", $2}' <<< ${line^^}` messages which are not published to any consumers"
+						} || { echo -e "$(colored "33" "[ QUEUE ${COUNT_QUEUES} ]") `awk '{print $1, "has", $2}' <<< ${line^^}` messages which are published to ${QUEUE_CONSUMER} consumers with ${QUEUE_RATE_READY}/s rate"; }
+						
+					fi
+				done < <(${RMQ_HOME}/rabbitmq.sh ctl list_queues)
+				echo -e "$(colored "32" "[ INFORMATION ]") Total number of queued messages: ${COUNT_MESSAGES} (belonging to ${COUNT_QUEUES} queues)"
+				[[ ${COUNT_QUEUES_ERROR} -gt 0 ]] && { echo -e "$(colored "31" "[ CRITICAL WARNING ]") ${COUNT_QUEUES_ERROR} queues have no consumers (components belonging to BSS SUITE should be checked)"; ERROR_QUEUES=1; }
+			fi
+		fi
+	fi
+
+	echo -e "\n$(colored "34" "Cluster status of node ${IP_ADDRESS} ( ${HOSTNAME} )")"
+	${RMQ_HOME}/rabbitmq.sh ctl cluster_status | sed -e '/Running..*/d' -e '/.*done./d' -e '/Cluster status.*/d'
+
+	for running_nodes in $(${RMQ_HOME}/rabbitmq.sh ctl cluster_status | tr '\n' ' ' | sed -e 's|Running.*nodes,\[{disc,\[||g' -e 's|\]}\]},.*{running_nodes.*||' -e 's|[[:blank:]]||g' | tr ',' ' '); do
+		if ! grep -q ${running_nodes} <<< $(${RMQ_HOME}/rabbitmq.sh ctl cluster_status | tr '\n' ' ' | sed -e 's|Running.*running_nodes,\[||g' -e 's|\]}.*cluster_name.*||'); then
+			echo -e "\n$(colored "31" "[ CRITICAL WARNING ]") Node ${running_nodes} is outside clustered running nodes"
+			echo -e "$(colored "31" "[ CRITICAL WARNING ]") RabbitMQ cluster status should be analyzed (dropped node has to be launched)"
+			CLUSTER_ERROR=1
+		fi
+	done
+
+	[[ ${COUNTER_FLAG} == 'TRUE' ]] && {
+		function check_current_value() { ${RMQ_HOME}/rabbitmq.sh ctl list_queues | awk '$2 != 0 { sum += $2 } END { print sum }'; }
+		acceptable_queues=$(grep ^"RABBITMQ_TRESHOLD" ~/bin/servers.arr | awk '{print $2}')
+		counter=1; wait_counter=10
+
+		echo -e "\n$(colored "34" "[ INFORMATION ]") BSS SUITE components store $(check_current_value) unprocessed queues on RabbitMQ stack"
+		echo -e "$(colored "34" "[ INFORMATION ]") Waiting until number of queued messages will be less than the threshold value (currently set: ${acceptable_queues})"
+
+		while [[ $(check_current_value) -gt ${acceptable_queues} ]] && [[ ${counter} -lt ${wait_counter} ]]; do
+			echo -e "$(colored "33" "[ $counter out of 10 ]") Total number of queued messaged: $(check_current_value) ( overall waiting time: $((60*$counter)) sec )"
+			counter=$(($counter+1))
+			sleep 60
+
+			[[ ${counter} -eq ${wait_counter} ]] && {
+				echo -e "$(colored "31" "[ CRITICAL WARNING ]") Unprocessed $(check_current_value) messages are belonging to below queues:"
+				${RMQ_HOME}/rabbitmq.sh ctl list_queues | awk '(NF==2) && $2 != 0 { print $1 }'
+				echo -e "$(colored "31" "[ CRITICAL WARNING ]") Components belonging to BSS SUITE should be veryfied (in urgent cases please contact ITOPS department)"
+				exit 1
+			}
+		done
+		echo -e "$(colored "32" "[ INFORMATION ]") Total number of queued messages is below threshold value"
+	}
+
+	([[ -z ${RESULT_SERVER} && -z ${RESULT_ERLANG} ]] || [[ ${RESULT_SERVER} && -z ${RESULT_ERLANG} ]] || [[ -z ${RESULT_SERVER} && ${RESULT_ERLANG} ]] || [[ ${CLUSTER_ERROR} -eq 1 ]]) && exit 1 || :
+}
+
+#--------------------------------------------------------------------#
+#------------------------- REMOTE HOSTS -----------------------------#
+#--------------------------------------------------------------------#
+
+function REMOTE_RMQ() {
+	TEMP_ENVRIONMENT_ARRAY=$(echo "${SERVERS_ARRAY[@]}" | sed "/.*`whoami`.*${IP_ADDRESS}/d")
+	readarray VERYFIED_ENVRIONMENT_ARRAY <<< "${TEMP_ENVRIONMENT_ARRAY}"
+
+	for SERVER in "${VERYFIED_ENVRIONMENT_ARRAY[@]}"; do
+		SERV=($SERVER)
+		if [[ "${SERV[0]}" = "${SHOW_ENV_NAME}" && "${SERV[1]}" =~ ^(CPM|CRM)$ ]]; then
+			ssh -qo BatchMode=yes ${SERV[4]}@${SERV[2]} "bash -l -c 'rmq_manage $1 $2 ${ENV_NAME} current'" 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED."
+			PIPE_EXIT_STATUS=${PIPESTATUS[0]}
+			[[ $2 == 'status' ]] && [[ ${PIPE_EXIT_STATUS} -eq 1 ]] && ERROR=1
+		fi
+	done
+}
+
+#--------------------------------------------------------------------#
+#------------------------- COPYING SCRIPTS --------------------------#
+#--------------------------------------------------------------------#
+
+function MD5_SUM() {
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		# update scripts for current environment, declared environment type and for nodes that are different than set: current IP and current user
+		if [[ "${SERV[0]}" = "${SHOW_ENV_NAME}" && "${SERV[1]}" =~ ^(CPM|CRM)$ && "${SERV[6]} ${SERV[4]}" != "${IP_ADDRESS} ${CURRENT_USER}" ]]; then
+			SSH_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${SERV[4]}@${SERV[2]} echo confirmed 2>&1)
+			if [[ $SSH_STATUS == 'confirmed' ]]; then
+				SUM=(`ssh -qo BatchMode=yes ${SERV[4]}@${SERV[2]} md5sum $(echo ${SCRIPT_DIR} | sed "s|${CURRENT_USER}|${SERV[4]}|g") 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED."`)
+				if [[ ${md5_local[0]} != ${SUM[0]} ]]; then
+					RESULT=$(scp -pq ${SCRIPT_DIR} ${SERV[4]}@${SERV[2]}:$(echo ${SCRIPT_DIR} | sed "s|${CURRENT_USER}|${SERV[4]}|g") 2>&1); CODE=$?
+					if [ ${CODE} -ne 0 ]; then
+						echo -e "$(colored "31" "[ CRITICAL ERROR ]") Script `basename "$0"` encountered errors during scripts update (please contact ITOPS department)"
+						echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error code: ${CODE}"
+						echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error line: ${RESULT}"
+						exit 1
+					fi
+				fi
+			else
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") Script `basename "$0"` encountered errors during execution (please contact ITOPS department)"
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") SSH connection to remote host: ${SERV[4]}@${SERV[2]} is denied"
+				exit 1
+			fi
+		fi
+	done
+}
+
+#--------------------------------------------------------------------#
+#------------------------- PRECONDITIONS ----------------------------#
+#--------------------------------------------------------------------#
+
+# check if user links to proper environment
+if [ ${SHOW_ENV_NAME,,} != ${ENV_NAME,,} ]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong environment was definied during script induction."
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Current environment: ${SHOW_ENV_NAME^^}. Definied environment: ${ENV_NAME^^}.\n"
+	exit 1
+fi
+
+chmod 400 ~/.erlang.cookie # repair permissions (only read permission for current user)
+chmod 764 ${RMQ_HOME}/rabbitmq.sh # gren execute permission for current user
+
+# checking if addiotional nodes are present and meet the requirements of release
+([[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]] && [[ ${REMOTE_HOST} != '0' ]] && [[ ! "${CUR_NAME}" =~ ^(current|noerror)$ ]]) && [[ "${SYSTEM_VERSION}" -ge '70' ]] && CHECK_NODES="TRUE"
+
+[[ ! `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w 'RMQ'` ]] && {
+	echo -e "\n$(colored "31" "[ INFORMATION ]") Application has not been configured according to high availability requirements"
+	echo -e "$(colored "31" "[ INFORMATION ]") Binaries need to be deployed and configured on remote hosts. Please contact ITOPS department."
+	CHECK_HA_APP='FALSE'
+} || CHECK_HA_APP='TRUE'
+
+# check if another process is running in parallel
+if [[ "${JOB}" =~ ^(stop|restart|start)$ ]]; then
+	mkdir -p ~/bin/PID_files # create required folders
+	([[ -f "$PID_FILE" ]] && [[ `cat $PID_FILE` ]]) && echo -e "$(colored "31" "[ WARNING ]") Another process with `cat $PID_FILE` PID is already written to $(basename $0).pid lockfile on ${IP_ADDRESS} ( ${HOSTNAME} )"
+	for CHECK_ANOTHER_PID in $(pidof -x $(basename $0)); do
+		if [ ${CHECK_ANOTHER_PID} != ${PARENT_PID} ]; then
+			echo -e "$(colored "31" "[ WARNING ]") Terminating already running process with ${CHECK_ANOTHER_PID} PID on ${IP_ADDRESS} ( ${HOSTNAME} )"
+			kill -9 ${CHECK_ANOTHER_PID} &>/dev/null # kill silently
+		fi
+	done
+	echo ${PARENT_PID} > "${PID_FILE}"
+fi
+
+# update scripts on all nodes - comparing to main node
+if [[ "${JOB}" =~ ^(stop|restart|start|status)$ ]] && [[ -z $(echo "$@" | grep -w 'current') ]] && [[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w 'RMQ'` ]]; then
+	if [ "${IP_ADDRESS}" = "${LOCAL_HOST}" ] && [ ${REMOTE_HOST} != '0' ]; then
+		md5_local=`md5sum ${SCRIPT_DIR} | awk '{ print $1 }'`
+		MD5_SUM
+	fi
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTIONS CALL ---------------------------#
+#--------------------------------------------------------------------#
+
+# create tasks list if was definied switch requiring serveral basic tasks
+[[ "${JOB}" == 'restart' ]] && PROCESS_TASK="stop start status" || PROCESS_TASK="${JOB}"
+
+for TASK in ${PROCESS_TASK}; do
+	# execute task on remote hosts only when script was launched from localhost and has no additional arguments pointing to current host and application is configured according to HA requirements
+	[[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]] && [[ -z $(echo "$@" | grep -w 'current') ]] && [[ ${CHECK_NODES} = "TRUE" ]] && [[ ${CHECK_HA_APP} == 'TRUE' ]] && REMOTE_RMQ "${SERVER_NAME}" "${TASK}"
+	! ([[ "${IP_ADDRESS}" != "${LOCAL_HOST}" ]] && [[ ${CHECK_HA_APP} == 'FALSE' ]]) && "${TASK^^}"_PROCESSES
+done
+
+#--------------------------------------------------------------------#
+#-------------------- POST REQUIREMENTS CHECK -----------------------#
+#--------------------------------------------------------------------#
+
+# return error code, when '--performance' switch was in induction arguments
+([[ ${PERFORMANCE_FLAG} == 'TRUE' ]] && [[ ${ERROR_QUEUES} -ne 0 ]]) && exit 1 || exit 0

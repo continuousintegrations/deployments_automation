@@ -1,0 +1,817 @@
+#!/bin/bash -
+# applications management and administrative tool by adam.chalat@comarch.com
+# WARNING: each session creates exclusive lockfile which prevents from removing decrypted management files
+# script requires RSA keys exchange between all nodes
+# administration scripts are encrypted with openssl
+# remember to change 'PARAMETERS TASK' section if the letter has been modified
+# script handles following arguments: --noresize (do not move and resize terminal window)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="24.07.2017r."
+SCRIPT_VERSION="0.2.32"
+
+source ~/bin/location_finder
+TEMP_USER=${USER} # store default user name (variables during loop are set globally)
+
+[[ `grep ^PROTECTED_ENVIRONMENTS ~/bin/servers.arr | grep ${SHOW_ENV_NAME}` ]] && PROTECT='TRUE' || PROTECT='FALSE' # check if environment is declared in PROTECTED_ENVIRONMENTS list
+[[ ${PROTECT} == 'TRUE' ]] && echo $$ > ~/bin/log/$$_mubemanage.lockfile # create exclusive lockfile
+
+#--------------------------------------------------------------------#
+#---------------------------- FUNCTIONS -----------------------------#
+#--------------------------------------------------------------------#
+
+function store_line() {
+	tput cup ${GET_CURRENT_LINE} 0 && tput ed
+	next_line=${GET_CURRENT_LINE}
+	echo "$(tput cup `echo ${next_line}` 4)$(tput rev) $1 $(tput sgr0)$(tput bold)$(tput cuf ${3}) ${ARRAY[$2]}$(tput sgr0)$(tput el)"
+}
+
+function catch_user_input_main() {
+	next_line=$[${next_line}+2]; count=''
+	while [[ ! ${application_choice} =~ ^${range}$|^${range}${range_additional}$ ]]; do
+		(( count++ )); [[ ${count} -gt 1 ]] && tput cuu 0 && tput el # move cursor up #0 lines and clear line (start, when first input was wrong)
+		read -p "$(tput sgr0)$(tput bold)$(tput cup `echo ${next_line}` 4)Enter administrative choice ${range_value} $(tput sgr0)" application_choice
+	done
+
+	extract_application_array=($extract_application_list)
+	extract_application="${extract_application_array[`echo ${application_choice}`]}"
+	store_line "CHOSEN MANAGEMENT TOOL" "application_choice" "8"
+}
+
+function catch_user_input() {
+	GET_CURRENT_LINE=$((GET_CURRENT_LINE + 2))
+	next_line=$[${next_line}+2]; count=''
+	while [[ ! $exercise_choice =~ ^${range}$ ]]; do # remember that range should be from [0-9] (in other case look to catch_user_input_main function <^[0-9]+$>)
+		(( count++ )); [[ ${count} -gt 1 ]] && tput cuu 0 && tput el # move cursor up #0 lines and clear line (start, when first input was wrong)
+		read -p "$(tput sgr0)$(tput bold)$(tput cup `echo ${next_line}` 4)Enter component choice ${range} $(tput sgr0)" exercise_choice
+	done
+
+	exercise_array=($exercise_chocie_list)
+	exercise_task="${exercise_array[`echo ${exercise_choice}`]}"
+	store_line "CHOSEN COMPONENT" "exercise_choice" "14"
+}
+
+function show_AT_statement() {
+	[[ ${SHOW_ENV_TYPE} != ${environment_choice^^} ]] && LABEL_COLOR=1 || LABEL_COLOR=7
+
+	if [[ $1 == 'AT' ]]; then
+		next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput rev) ADDITIONAL SERVER TOOLS $(tput sgr0)"
+	elif [[ $1 == 'EXIT_STAT' ]] && [[ ${SHOW_ENV_TYPE} != ${environment_choice^^} ]]; then
+		next_line=$[${next_line}+2]; echo "$(tput sgr0)$(tput cup `echo ${next_line}` 4)$(tput rev) COLOURS DESCRIPTION $(tput sgr0)" \
+		"$(tput setaf 7)Available from ${SHOW_ENV_TYPE} nodes$(tput sgr0) $(tput setaf 6)|$(tput sgr0) $(tput setaf 1)Unavailable remotely$(tput sgr0)"
+	elif [[ -z $1 ]]; then
+		next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput rev) DEPLOYMENT TOOLS $(tput sgr0)"
+	fi
+}
+
+function color_check() {
+	GET_LOCAL_HOST=$(grep ^"${SHOW_ENV_NAME}" ~/bin/servers.arr | grep ${environment_choice^^} | awk '$4 == /1/ { print }' | head -n1 | awk '{ print $7 }') # get local host address depending on chosen environment type
+	next_line=$[${next_line}+2]; echo "$(tput sgr0)$(tput cup `echo ${next_line}` 6)$(tput rev) COLOURS DESCRIPTION $(tput sgr0)" \
+	"$(tput setaf 7)Available$(tput sgr0) $(tput setaf 6)|$(tput sgr0) $(tput setaf 3)Available from ${GET_LOCAL_HOST} node $(tput setaf 6)|$(tput sgr0) $(tput setaf 1)Unavailable$(tput sgr0)"
+}
+
+function adapt_colors() {
+	# color adjustment to the node number
+	if [[ ${SHOW_ENV_TYPE^^} == ${environment_choice^^} ]]; then
+		[[ ${LOCAL_HOST} == ${IP_ADDRESS} ]] && COLOR_CHECK=7 || { [[ `grep ^"${SHOW_ENV_NAME^^}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w $1` ]] && COLOR_CHECK=7 || COLOR_CHECK=3; }
+	else
+		COLOR_CHECK=7
+	fi
+}
+
+function DECODE() {
+	# decrypt encoded management script and grant executables privileges
+	[[ ${PROTECT} == 'TRUE' ]] && { ssh -qo BatchMode=yes ${USER}@${HOST} "bash -l -c 'cat ~/bin/${1}.enc | openssl aes-128-cbc -a -d -salt -k ${admin_access} > ~/bin/${1}; chmod 700 ~/bin/${1}'"; }
+}
+
+function gather_app_version() {
+	if [[ ${SCRIPT_NAME} =~ ^(bss_manage|tum_manage|crm_manage|dps_manage|bpc_manage|aif_manage)$ ]]; then
+		for SERVER in "${SERVERS_ARRAY[@]}"; do
+			SERV=($SERVER); VERSION=''
+			if [[ "${SERV[0]}" = "${SHOW_ENV_NAME^^}" && "${SERV[3]}" = "1" ]]; then
+				if [[ ${IP_ADDRESS} == ${SERV[6]} ]] && [[ ${SERV[4]} == ${TEMP_USER} ]]; then
+					[[ ${PROTECT} == 'TRUE' ]] && { cat ~/bin/${SCRIPT_NAME}.enc | openssl aes-128-cbc -a -d -salt -k ${admin_access} > ~/bin/${SCRIPT_NAME}; chmod 700 ~/bin/${SCRIPT_NAME}; }
+					VERSION=$(${SCRIPT_NAME} --version 2>/dev/null)
+				else
+					[[ ${PROTECT} == 'TRUE' ]] && DECODE ${SCRIPT_NAME} &>/dev/null
+					VERSION=$(ssh -qo BatchMode=yes ${USER}@${HOST} "bash -l -c '${SCRIPT_NAME} --version'" 2>&-)
+				fi
+				[[ ${VERSION} ]] && break
+			fi
+		done
+	fi
+}
+
+function check_connection_and_execute() {
+	HOST="${SERV[2]}"; USER="${SERV[4]}"
+	SSH_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${USER}@${HOST} echo confirmed 2>&1)
+	# decrypt required files and execute task
+	if [[ $SSH_STATUS == 'confirmed' ]]; then
+		DECODE ${extract_application} &>/dev/null
+		ssh -qo BatchMode=yes ${USER}@${HOST} "bash -l -c '${TASK}'"
+	else
+		echo -e "$(colored "31" "[ ERROR ]") SSH connection to remote host: ${USER}@${HOST} is denied"
+	fi
+}
+
+function clean_decoded_scripts() {
+	function run_in_background() {
+		# remove all decoded scripts if environment is protected
+		source ~/bin/location_finder
+		echo "Starting post execution tasks - `date`"
+		if [[ `grep ^PROTECTED_ENVIRONMENTS ~/bin/servers.arr | grep ${SHOW_ENV_NAME}` ]]; then
+			echo "Cleaning decrypted management scripts"
+			[[ ! `find ~/bin/log -name "*_mubemanage.lockfile"` ]] && find ~/bin -maxdepth 1 -type f -name "*_manage" -exec rm -f {} \;
+			for SERVER in "${SERVERS_ARRAY[@]}"; do
+				SERV=($SERVER)
+				if [[ "${SERV[0]}" == "${SHOW_ENV_NAME^^}" ]]; then
+					HOST="${SERV[2]}"; USER="${SERV[4]}"
+					# remove decrypted files from all nodes if any other mubemanage instance is currently working (mubemanage.lockfile)
+					ssh -qo BatchMode=yes ${USER}@${HOST} "bash -l -c '[[ ! \`find ~/bin/log -name \"*_mubemanage.lockfile\"\` ]] && find ~/bin -maxdepth 1 -type f -name \"*_manage\" -exec rm -f {} \;'" &>/dev/null
+				fi
+			done
+		fi
+		echo "Tasks completed successfully - `date`"
+	}
+	([[ -z ${TASK} ]] && [[ -z ${admin_access} ]]) && tput clear # clear only when script was terminated
+	rm -f ~/bin/log/$$_mubemanage.lockfile
+	stty sane; [[ -z ${TASK} ]] && tput rs1 # fix terminal configuration after SIGKILL 
+
+	IFS=${RESTORE_IFS} # restore IFS definition
+	export -f run_in_background
+	nohup bash -c run_in_background >> ${SHOW_DEFAULT_PATH}/bin/log/mubemanage_`date +%Y.%m.%d`.log 2>&1 0</dev/null &
+}
+
+#--------------------------------------------------------------------#
+#------------------------- MANAGEMENT TOOLS -------------------------#
+#--------------------------------------------------------------------#
+
+function elasticsearch_backup() {
+	echo "Performing ElasticSearch backup"
+	if [[ "${SHOW_ENV_NAME}" =~ ^(SIT|TST|PRF|TTM)$ ]]; then
+		es_manage all backup ${SHOW_ENV_NAME}
+	else
+		cd ${SHOW_DEFAULT_PATH}/servers/ES 
+		tar -czf backup_`date +\%Y\%m\%d\%H\%M`.tar.gz */data
+	fi
+	echo "ElasticSearch backup successfully performed"
+}
+
+function mbcore_backup() {
+	echo "MBCore backup"
+	cd ${SHOW_DEFAULT_PATH}/liquibase/utilities
+	./dataupgrade_deploy.sh DataUpgrade_Prerequisites
+}
+
+function remove_tytan_sessions() {
+	echo "Executing - remove tytan sessions"
+	cd ${SHOW_DEFAULT_PATH}/liquibase/utilities
+	./tytan_sessions.sh BSS_Upgrade_TytanSessions
+}
+
+function install_liquibase() {
+	if [[ ${SHOW_ENV_TYPE} = 'CRM' ]]; then
+		cd ${SHOW_DEFAULT_PATH}/liquibase
+		read -p "$(tput bold)$(tput cup 2 4)Please pass liquibase full name $(tput sgr0)" task_choice
+		echo ${task_choice} > packages_crm
+		upgrade_crm_db ${SHOW_ENV_NAME}
+	elif [[ ${SHOW_ENV_TYPE} = 'CPM' ]]; then
+		read -p "$(tput bold)$(tput cup 2 4)Please pass liquibase name without extension and additionally add option '--nodelete' $(tput sgr0)" task_choice
+		bsupgrade manual ${task_choice}
+	fi
+}
+
+function import_database() {
+	next_line=2; echo "$(tput cup `echo ${next_line}` 4)$(tput rev)TASK MENU$(tput sgr0)"
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] Import BPM definitions"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 1 ] Import Organizations"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 2 ] Import Custom Attributes"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 3 ] Import Liferay"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 4 ] Import Reports Files"
+
+	next_line=$[${next_line}+2]
+	while [[ ! $task_choice =~ ^[0-4]$ ]]; do
+		read -p "$(tput bold)$(tput cup `echo ${next_line}` 4)Enter task choice [0-4] $(tput sgr0)" task_choice
+	done
+
+	task_choice_list="-e -o -t -l -j'"
+	choice_array=($task_choice_list)
+	chosen_task="${choice_array[`echo ${task_choice}`]}"
+
+	cd ${SHOW_DEFAULT_PATH}/ConfigurationImporterPkg/bin 
+	./upgrade.sh ${chosen_task}
+}
+
+function information_about_release() {
+	echo -e "`printf '=%.0s' {1..60}`" "\n$(tput setaf 6)Information about release$(tput sgr0)" "\n`printf '=%.0s' {1..60}`"
+	if [[ ${SHOW_ENV_TYPE} = 'CRM' ]]; then
+		grep ${SHOW_ENV_NAME} ${SHOW_DEFAULT_PATH}/servers/presentation/d10000conf_presentation/conf/build.ver | echo $(tput bold)Presentation version:$(tput sgr0) `awk '{print $3}'`
+	elif [[ ${SHOW_ENV_TYPE} = 'CPM' ]]; then
+		cd ${SHOW_DEFAULT_PATH}/servers/launcher
+		readlink -f current | echo $(tput bold)Current used binaries:$(tput sgr0) `sed -e 's/.*\///g'`
+	elif [[ ${SHOW_ENV_TYPE} = 'DPS' ]]; then
+		cd ${SHOW_DEFAULT_PATH}/admin/RAT_${SUFFIX}
+		readlink -f current | echo $(tput bold)Current used binaries by RAT_${SUFFIX}:$(tput sgr0) `sed -e 's/.*\///g'`
+		cd ${SHOW_DEFAULT_PATH}/admin/NOC_${SUFFIX}
+		readlink -f current | echo $(tput bold)Current used binaries by NOC_${SUFFIX}:$(tput sgr0) `sed -e 's/.*\///g'`
+	fi
+}
+
+function hostname_info() {
+	local dnsips=$(sed -e '/^$/d' /etc/resolv.conf | awk '{if (tolower($1)=="nameserver") print $2}')
+	echo -e "`printf '=%.0s' {1..60}`" "\nHostname and DNS information" "\n`printf '=%.0s' {1..60}`"
+
+	echo "Hostname: $(hostname -s)"
+	echo "DNS domain: $(hostname -d)"
+	echo "Fully qualified domain name: $(hostname -f)"
+	echo "Network address (IP): $(hostname -i)"
+	echo "DNS name servers (DNS IP): ${dnsips}"
+}
+
+function network_info() {
+	devices=$(netstat -i | cut -d" " -f1 | egrep -v "^Kernel|Iface|lo")
+	echo -e "`printf '=%.0s' {1..60}`" "\nNetwork information" "\n`printf '=%.0s' {1..60}`"
+
+	echo -e "\n`printf '=%.0s' {1..60}`" "\nTotal network interfaces found: $(wc -w <<< ${devices})" "\n`printf '=%.0s' {1..60}`"
+	ip -4 address show
+	echo -e "\n`printf '=%.0s' {1..60}`" "\nNetwork routing" "\n`printf '=%.0s' {1..60}`"
+	netstat -nr
+	echo -e "\n`printf '=%.0s' {1..60}`" "\nInterface traffic information" "\n`printf '=%.0s' {1..60}`"
+	netstat -i
+}
+
+function user_info() {
+	echo -e "`printf '=%.0s' {1..60}`" "\nList of last logged in users" "\n`printf '=%.0s' {1..60}`"
+	last | awk '(NR<50){print $0}'
+}
+
+function architecture() {
+	echo -e "${SHOW_ENV_NAME^^} environment configuration\n"
+	grep ^${SHOW_ENV_NAME^^} ~/bin/servers.arr
+}
+
+#--------------------------------------------------------------------#
+#-------------------- INITIAL PREREQUISITES -------------------------#
+#--------------------------------------------------------------------#
+
+RESTORE_IFS="${IFS}" # IFS definition which is overwritten during script execution
+mkdir -p ${SHOW_DEFAULT_PATH}/bin/log # create required directories
+touch ${SHOW_DEFAULT_PATH}/bin/log/mubemanage_`date +%Y.%m.%d`.log # logfile (post execution and executed tasks logs)
+
+trap 'clean_decoded_scripts' 0 EXIT SIGKILL SIGTERM # remove encrypted files on exit
+# enabling the termination of the script at the moment of capture the signal from the keyboard during read while loop
+trap 'tput el1; next_line=$[${next_line}]; echo "$(tput sgr0)$(tput setaf 1)$(tput cup `echo ${next_line}` 4)Script was aborted by user ( catched SIGINT signal )$(tput sgr0)"; exit 1' SIGINT
+
+[[ -z $(echo "$@" | grep -w '\-\-noresize') ]] && {
+	printf '\e[3;0;0t' # move windows to [x, y] (http://invisible-island.net/xterm/ctlseqs/ctlseqs.html)
+	printf '\e[8;60;150t' # resize xterm window to given hieght and width in characters
+}
+
+if [[ `grep ^PROTECTED_ENVIRONMENTS ~/bin/servers.arr | grep ${SHOW_ENV_NAME}` ]]; then
+	unset admin_access
+	echo -e "\n$(colored "33" "[ INFORMATION ]") Applications and deployment management is protected against unauthorized access"
+	printf "$(colored "33" "[ INFORMATION ]") Enter password or contact ITOPS department in order to grant administration privileges: " 1>&2
+	
+	# based on http://www.ict.griffith.edu.au/anthony/software/#ask_password_stars
+	while IFS= read -r -n1 -s password_characters; do
+		case "$( echo -n "${password_characters}" | od -An -tx1 )" in
+			'') break ;;
+  			' 08'|' 7f')  # backspace or delete
+			[ -n "${admin_access}" ] && { admin_access="$( echo "${admin_access}" | sed 's/.$//' )"; echo -n $'\b \b' 1>&2; } #
+			;;
+			' 15')
+			echo -n "${admin_access}" | sed 's/./\cH \cH/g' >&2 #
+			admin_access=''
+			;;
+			*)  admin_access="${admin_access}${password_characters}"
+			echo -n '*' 1>&2  #
+			;;
+		esac
+	done
+
+	FIND_FILE=`find ~/bin -name "*_manage.enc" | head -n1` # find any management file to check if entered password is correct
+	cat ${FIND_FILE} | openssl aes-128-cbc -a -d -salt -k ${admin_access} > ${FIND_FILE%.enc} 2>/dev/null
+	[[ $? -ne 0 ]] && \
+	{ echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Entered password is incorrect. The event has been reported.\n"; exit 1; } || \
+	{ chmod 700 ~/bin/${extract_application}; }
+fi
+
+#--------------------------------------------------------------------#
+#-------------------------- USER GUI --------------------------------#
+#--------------------------------------------------------------------#
+
+next_line=2; echo "$(tput clear)$(tput cup `echo ${next_line}` 4)$(tput setaf 2)APPLICATIONS MANAGEMENT AND ADMINISTRATIVE TOOL$(tput sgr0)"
+echo "$(tput cup `echo $[${next_line}+1]` 4)Version: $(tput setaf 6)${SCRIPT_VERSION}$(tput sgr0) | Last modification: $(tput setaf 6)${BUILD_DATE}$(tput sgr0) | Author: $(tput setaf 6)adam.chalat@comarch.com$(tput sgr0)"
+
+next_line=$[${next_line}+3]; echo "$(tput cup `echo ${next_line}` 4)$(tput rev) CURRENT ENVIRONMENT NODE $(tput sgr0)$(tput cuf 6)$(tput bold) ${SHOW_ENV_NAME^^} | ${SHOW_ENV_TYPE^^} | ${IP_ADDRESS}$(tput sgr0)$(tput el)"
+if [[ ${REMOTE_HOST} != 0 ]]; then
+	# check current IP and define the rest range of nodes
+	[ ${IP_ADDRESS} != `grep ^${SHOW_ENV_NAME} ~/bin/servers.arr | grep ${SHOW_ENV_TYPE} | awk '$4 == /1/ { print }' | awk '{print $3}'` ] && \
+	REMOTE_HOST_NAME=`grep ^${SHOW_ENV_NAME} ~/bin/servers.arr | grep ${SHOW_ENV_TYPE} | grep -v ${IP_ADDRESS} | awk '{ printf "%s ", $3 }'`
+
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 4)$(tput rev) HIGH AVAILABILITY NODES $(tput sgr0)$(tput cuf 7) ${REMOTE_HOST_NAME}$(tput sgr0)$(tput el)"
+fi
+
+MUBEMANAGE_PIDS=$(ps -fu `whoami` | grep [^]]mubemanage | grep -v $$ | awk '{printf "%s ", $2}')
+if [[ `echo ${MUBEMANAGE_PIDS} | wc -w` -gt 0 ]]; then
+	next_line=$[${next_line}+2]
+	echo "$(tput cup `echo $[${next_line}]` 4)$(tput bold)$(tput setaf 3)Simultaneously running processes:$(tput sgr0) ${MUBEMANAGE_PIDS}"
+
+	# list processes by PID, working time in seconds, executed command and user, than search current user's PIDs older than 12h
+	# TERMINATE_PROCS=$(ps -eo pid,etimes,comm,user | awk -v var=`whoami` '$4 ~ var {if ($2 > 43200) print}' | grep mubemanage | awk '{printf "%s ", $1}') - system older than RedHat 7.0
+	TERMINATE_PROCS=$(ps -o pid,comm,etime -u `whoami` | grep mubemanage | awk 'int(substr($3,1,index($3,"-"))) >= 1 { print }' | awk '{printf "%s ", $1}')
+	if [[ ${TERMINATE_PROCS} ]]; then
+		next_line=$[${next_line}+1]; echo "$(tput cup `echo $[${next_line}]` 4)$(tput bold)$(tput setaf 3)Terminating suspended processes (older than 24hours):$(tput sgr0) ${TERMINATE_PROCS}"
+		kill -9 ${TERMINATE_PROCS} &>/dev/null
+	fi
+fi
+
+next_line=$[${next_line}+2] # move down to avoid overwritting another statements
+for COUNTER in {10..1}; do
+	# catching user input - check application status choice
+	tput el1; read -n1 -r -t1 -p "$(tput bold)$(tput cup `echo ${next_line}` 4)$(tput setaf 1)[ WAITING $COUNTER ]$(tput sgr0) Press any alphabetical key to skip status execution for applications and hardware $(tput sgr0)"
+	[[ ${REPLY} ]] && break
+done
+
+if [[ -z ${REPLY} ]]; then
+	START_TIME=${SECONDS}
+	APPS_ARRAY=(`grep ^DEFAULT_APPS ~/bin/servers.arr`)
+	APP_LIST=("es_manage.CPM.BSS:ElasticSearch" "es_manage.CPM.BPC:ElasticSearch" "rmq_manage.CPM.RabbitMQ" "zk_manage.CRM.ZooKeeper:server" "zk_manage.ALL.ZooKeeper:client" "bss_manage.CPM.BSS:Suite" "tum_manage.TUM.TUM" \
+		"crm_manage.CRM.CRM" "jr_manage.CRM.JackRabbit" "aif_manage.AIF.AIF" "dps_manage.DPS.DPS" "bpc_manage.BPC.BPC")
+
+	next_line=$[${next_line}]; message_line_update=${next_line}; echo "$(tput cup `echo ${next_line}` 4)$(tput rev) APPLICATIONS VERIFICATION STATUS $(tput sgr0)$(tput el)"; next_line=$[${next_line}+1]
+	for APP in ${APP_LIST[@]}; do
+		SCRIPT_NAME=$(echo ${APP} | cut -d'.' -f1); ENV_TYPE=$(echo ${APP} | cut -d'.' -f2); NAME=`echo ${APP} | cut -d'.' -f3 | tr ':' ' '`
+		[[ $(echo ${APP##*:}) =~ 'ElasticSearch' ]] && ARGUMENT=$(echo ${APP##*.} | sed 's|:.*||') || ARGUMENT='all'
+		! grep -q `echo ${NAME} | awk '{print $1}'` <<< ${APPS_ARRAY[@]} && { tput el; continue; }
+		next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput blink)$(tput setaf 5)[ PLEASE WAIT ]$(tput sgr0)$(tput blink) Status for `echo ${APP} | cut -d'.' -f3 | tr ':' ' '` application is obtained$(tput sgr0)"
+		
+		USER=${TEMP_USER}; ERRORS_NODES=''; ERRORS_SSH_NODES=''; CODE=0; SSH_ERROR=0; CHECK_LOOP='FALSE' # reset values to original state for each loop iteration (remember, that USER variable is overwritten for launched shell)
+		if [[ ${SCRIPT_NAME} == 'zk_manage' ]] && [[ ${ENV_TYPE} == 'ALL' ]]; then
+			for SERVER in "${SERVERS_ARRAY[@]}"; do
+				SERV=($SERVER)
+				if [[ "${SERV[0]}" = "${SHOW_ENV_NAME^^}" && "${SERV[1]}" =~ ^(CRM|CPM|TUM|BPC|AIF)$ ]]; then
+					HOST="${SERV[2]}"; USER="${SERV[4]}"
+					if [[ ${IP_ADDRESS} == ${SERV[6]} ]] && [[ ${USER} == ${TEMP_USER} ]]; then
+						[[ ${PROTECT} == 'TRUE' ]] && cat ~/bin/${SCRIPT_NAME}.enc | openssl aes-128-cbc -a -d -salt -k ${admin_access} > ~/bin/${SCRIPT_NAME}; chmod 700 ~/bin/${SCRIPT_NAME}
+						${SCRIPT_NAME} client status ${SHOW_ENV_NAME^^} &>/dev/null; ERROR=$? # execute directly on calling node
+						[[ ${ERROR} -ne 0 ]] && CODE=1 && ERRORS_NODES+="${USER}@${HOST} "
+					else
+						SSH_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${USER}@${HOST} echo confirmed 2>&1)
+						if [[ $SSH_STATUS =~ 'confirmed' ]]; then
+							[[ ${PROTECT} == 'TRUE' ]] && \
+							DECODE ${SCRIPT_NAME} &>/dev/null
+							ssh -qo BatchMode=yes ${USER}@${HOST} "bash -l -c '${SCRIPT_NAME} client status ${SHOW_ENV_NAME^^}'" &>/dev/null; ERROR=$? # execute on remote host
+							[[ ${ERROR} -ne 0 ]] && CODE=1 && ERRORS_NODES+="${USER}@${HOST} "
+						else
+							CODE=1; SSH_ERROR=1; ERRORS_SSH_NODES+="${USER}@${HOST} "
+						fi
+					fi
+					CHECK_LOOP='TRUE'
+				fi
+			done
+		elif [[ ${SHOW_ENV_TYPE} != ${ENV_TYPE} ]] || ([[ ${LOCAL_HOST} != ${IP_ADDRESS} ]] && [[ ${SHOW_ENV_TYPE} == ${ENV_TYPE} ]]); then
+			for SERVER in "${SERVERS_ARRAY[@]}"; do
+				SERV=($SERVER)
+				if [[ "${SERV[0]}" = "${SHOW_ENV_NAME^^}" && "${SERV[1]}" = "${ENV_TYPE^^}" ]]; then
+					HOST="${SERV[2]}"; USER="${SERV[4]}"
+					SSH_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${USER}@${HOST} echo confirmed 2>&1)
+					if [[ $SSH_STATUS =~ 'confirmed' ]]; then
+						[[ ${PROTECT} == 'TRUE' ]] && \
+						DECODE ${SCRIPT_NAME} &>/dev/null
+						ssh -qo BatchMode=yes ${USER}@${HOST} "bash -l -c '${SCRIPT_NAME} ${ARGUMENT} status ${SHOW_ENV_NAME^^}'" &>/dev/null; CODE=$?
+						[[ ${CODE} -ne 0 ]] && ERRORS_NODES+="${USER}@${HOST} "
+					else
+						CODE=1; SSH_ERROR=1; ERRORS_SSH_NODES+="${USER}@${HOST} "
+					fi
+					CHECK_LOOP='TRUE'
+					break # break after first occurrence to avoid overwritting IP (variable ENV_TYPE is definied inside loop)
+				fi
+			done
+		else
+			[[ ${PROTECT} == 'TRUE' ]] && cat ~/bin/${SCRIPT_NAME}.enc | openssl aes-128-cbc -a -d -salt -k ${admin_access} > ~/bin/${SCRIPT_NAME}; chmod 700 ~/bin/${SCRIPT_NAME}
+			CHECK=`${SCRIPT_NAME} ${ARGUMENT} status ${SHOW_ENV_NAME^^} &>/dev/null`; CODE=$?
+			[[ ${CODE} -ne 0 ]] && ERRORS_NODES+="${USER}@${HOSTNAME} "
+			CHECK_LOOP='TRUE'
+		fi
+
+		tput cuu 1 && tput el # remove last line for overwrite
+		next_line=$[${next_line}]; VERSION=''
+		if [[ ${CODE} -eq 0 ]] && [[ ${CHECK_LOOP} == 'TRUE' ]]; then
+			gather_app_version
+			echo "$(tput cup `echo ${next_line}` 6)[ $(tput setaf 2)  OK  $(tput sgr0) ]   ${NAME} application verified successfully `[[ ${VERSION} ]] && echo \(version: $(tput setaf 4)${VERSION}$(tput sgr0)\)`"
+		else
+			if [[ ${SSH_ERROR} -eq 1 ]]; then
+				echo "$(tput cup `echo ${next_line}` 6)[ $(tput setaf 1)FAILED$(tput sgr0) ]   ${NAME} application cannot access remote host (RSA keys has to be exchanged for nodes: `echo ${ERRORS_SSH_NODES} | sed -e 's/ *$//g'`)"
+			else
+				gather_app_version
+				ERRORS_NODES=${ERRORS_NODES:-node_not_definied}
+				[[ ${CODE} -eq 2 ]] && { CLUSTER_APP=3; STATEMENT='VERIFY'; } # add indirect application status
+				echo "$(tput cup `echo ${next_line}` 6)[ $(tput setaf ${CLUSTER_APP:-1})${STATEMENT:-FAILED}$(tput sgr0) ]   ${NAME} application is not working correctly" \
+				"`[[ ${VERSION} ]] && echo \(version: $(tput setaf 4)${VERSION}$(tput sgr0)\)' '`(check status manually on nodes: ${ERRORS_NODES%' '})"
+			fi
+		fi
+	done
+
+	ELAPSED_TIME=$((${SECONDS} - $START_TIME))
+	restore_prevous_counter=${next_line}; next_line=${message_line_update}
+	echo "$(tput cup `echo ${message_line_update}` 4)$(tput rev) APPLICATIONS VERIFICATION STATUS $(tput sgr0)$(tput el) - took $ELAPSED_TIME seconds"
+	next_line=${restore_prevous_counter}
+
+	START_TIME=${SECONDS}
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput rev) INFORMATIONS ABOUT HARDWARE $(tput sgr0)$(tput blink)$(tput setaf 5) Gathering data$(tput sgr0)"; restore_prevous_counter=${next_line}
+	CPU=$(mpstat 5 1 | awk 'BEGIN{printf "Processor average load:\t\t"}$3 ~ /CPU/ { for(i=1;i<=NF;i++) { if ($i ~ /%idle/) field=i } } $3 ~ /all/ { printf "%5.2f%%", 100 - $field }')
+	MEMORY=$(free -m | awk 'BEGIN{printf "Available system memory:\t\t"}NR==2{printf "%5.0fG \t[ %2.0f%% ]\n", ($2-$3)/1024,100-$3*100/$2 }')
+	SPACE=$(df -Ph /opt | grep /opt | awk 'BEGIN{printf "Available disk space:\t\t"}{ printf "%5dG \t[ %2d%% ]\n", $4,100-$5 }')
+
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf 3)$CPU $(tput sgr0)$(tput el)"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf 3)$SPACE $(tput sgr0)$(tput el)"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf 3)$MEMORY $(tput sgr0)$(tput el)"
+	
+	current_line=${next_line}; ELAPSED_TIME=$((${SECONDS} - $START_TIME))
+	echo "$(tput cup `echo ${restore_prevous_counter}` 4)$(tput rev) INFORMATIONS ABOUT HARDWARE $(tput sgr0)$(tput el) - took $ELAPSED_TIME seconds"
+	next_line=${current_line}
+else
+	tput el1; next_line=$[${next_line}]; echo "$(tput setaf 1)$(tput cup `echo ${next_line}` 4)Status execution for applications and hardware was aborted$(tput sgr0)"
+fi
+
+#--------------------------------------------------------------------#
+#---------------------- ADMINISTRATION SECTION ----------------------#
+#--------------------------------------------------------------------#
+
+USER=${TEMP_USER} # restore default user (default variable is overwritten during loop, where variables are global)
+next_line=$[${next_line}+2]
+
+while [[ ! ${environment_choice^^} =~ ^(CPM|CRM|DPS|TUM|BPC|AIF|SYS)$ ]]; do
+	(( count++ )); [[ ${count} -gt 1 ]] && tput cuu 0 && tput el # move cursor up #0 lines and clear line (start, when first input was wrong)
+	read -p "$(tput bold)$(tput cup `echo ${next_line}` 4)Enter environment type that should be managed$(tput sgr0) (e.g. AIF, BPC, CPM, CRM, DPS, SYS, TUM) " environment_choice # Catching user input - environment choice
+done
+
+echo "$(tput cup `echo ${next_line}` 4)$(tput el)$(tput rev) CHOSEN ENVIRONMENT TYPE $(tput sgr0)$(tput bold)$(tput cuf 7) ${environment_choice^^}$(tput sgr0)$(tput el)"
+
+next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput rev) APPLICATION MANAGEMENT TOOLS $(tput sgr0)"; GET_CURRENT_LINE=${next_line}
+if [[ ${environment_choice^^} = 'CPM' ]]; then
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[  0 ] ElasticSearch Management"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[  1 ] RabbitMQ Management"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[  2 ] BSS Management"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[  3 ] ZooKeeper Management"
+	show_AT_statement
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  4 ]$(tput sgr0) Install BS/IMPL liquibase"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  5 ]$(tput sgr0) Load and publish offer"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  6 ]$(tput sgr0) ElasticSearch backup"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  7 ]$(tput sgr0) Remove tytan sessions"
+	show_AT_statement 'AT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  8 ]$(tput sgr0) Information about current release"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  9 ]$(tput sgr0) Environment architecture"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 10 ]$(tput sgr0) Hostname and DNS information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 11 ]$(tput sgr0) Network information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 12 ]$(tput sgr0) Logging information"
+	show_AT_statement 'EXIT_STAT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput sgr0)$(tput bold)$(tput setaf 4)For EXIT press 13$(tput sgr0)$(tput el)"
+
+	extract_application_list="es_manage rmq_manage bss_manage zk_manage install_liquibase load_offer elasticsearch_backup remove_tytan_sessions information_about_release architecture hostname_info network_info user_info exit_program"
+	ARRAY=("ElasticSearch Management" "RabbitMQ Management" "BSS Management" "ZooKeeper Management" "Install BS/IMPL liquibase" "Load and publish offer" "ElasticSearch backup" "Remove tytan sessions" \
+		"Information about current release" "Environment architecture" "Hostname and DNS information" "Network information" "Logging information" "EXIT")
+	range=[0-9]; range_additional=[0-3]; range_value=[0-13]
+	catch_user_input_main; GET_CURRENT_LINE=${next_line}
+
+	if [[ ${application_choice} = 0 ]]; then
+		next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] All definied instances"
+		next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 1 ] BPC Instance"
+		next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 2 ] BSS Instance"
+		
+		ARRAY=("All definied instances" "BPC Instance" "BSS Instance")
+		exercise_chocie_list="all bpc bss"
+		range=[0-2]
+		catch_user_input
+	elif [[ ${application_choice} = 1 ]]; then
+		exercise_task=all
+	elif [[ ${application_choice} = 2 ]]; then
+		next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] All"
+
+		next_line=$[${next_line}+1]; [[ `grep ^CQRS_START ~/bin/servers.arr | grep ${SHOW_ENV_NAME^^}` ]] && \
+		{ adapt_colors 'CQRS'; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 1 ] CQRS$(tput sgr0)"; } || echo "$(tput cup `echo ${next_line}` 6)$(tput setaf 1)[ 1 ] Cqrs$(tput sgr0)"
+
+		next_line=$[${next_line}+1]; [[ `grep ^INSTANCE_CPM_START ~/bin/servers.arr | grep ${SHOW_ENV_NAME^^}` ]] && \
+		{ adapt_colors 'FRONTEND'; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 2 ] Instance CPM$(tput sgr0)"; } || echo "$(tput cup `echo ${next_line}` 6)$(tput setaf 1)[ 2 ] Instance CPM$(tput sgr0)"
+
+		adapt_colors 'BACKEND'; next_line=$[${next_line}+1];echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 3 ] Backend"
+		adapt_colors 'FRONTEND'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 4 ] Frontend$(tput sgr0)"
+		
+		color_check
+		ARRAY=("All" "CQRS" "Instance CPM" "Backend" "Frontend")
+		exercise_chocie_list="all cqrs frontend_cpm backend frontend"
+		range=[0-4]
+		catch_user_input
+	elif [[ ${application_choice} = 3 ]]; then
+		exercise_task=client
+	fi
+elif [[ ${environment_choice^^} = 'CRM' ]]; then
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[  0 ] CRM Management"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[  1 ] JackRabbit Management"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[  2 ] RabbitMQ Management"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[  3 ] ZooKeeper Management"
+	show_AT_statement
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  4 ]$(tput sgr0) Install liquibase"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  5 ]$(tput sgr0) Import database definitions"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  6 ]$(tput sgr0) MBCore backup"
+	show_AT_statement 'AT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  7 ]$(tput sgr0) Information about current release"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  8 ]$(tput sgr0) Environment architecture"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[  9 ]$(tput sgr0) Hostname and DNS information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 10 ]$(tput sgr0) Network information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})$(tput setaf ${LABEL_COLOR})[ 11 ]$(tput sgr0) Logging information"
+	show_AT_statement 'EXIT_STAT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput sgr0)$(tput bold)$(tput setaf 4)For EXIT press 12$(tput sgr0)$(tput el)"
+
+	extract_application_list="crm_manage jr_manage rmq_manage zk_manage install_liquibase import_database mbcore_backup information_about_release architecture hostname_info network_info user_info exit_program"
+	ARRAY=("CRM Management" "JackRabbit Management" "RabbitMQ Management" "ZooKeeper Management" "Install liquibase" "Import database definitions" "MBCore backup" \
+		"Information about current release" "Environment architecture" "Hostname and DNS information" "Network information" "Logging information" "EXIT")
+	range=[0-9]; range_additional=[0-2]; range_value=[0-12]
+	catch_user_input_main; GET_CURRENT_LINE=${next_line}
+
+	if [[ ${application_choice} = 0 ]]; then
+		next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] All"
+		adapt_colors 'BATCH'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 1 ] Batch$(tput sgr0)"
+		adapt_colors 'BPM'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 2 ] BPM$(tput sgr0)"
+		adapt_colors 'ESB'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 3 ] ESB$(tput sgr0)"
+
+		next_line=$[${next_line}+1]; [[ `grep ^CRM_APPS ~/bin/servers.arr | grep esb11k` ]] && \
+		{ adapt_colors 'BACKEND'; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 4 ] ESB_11000$(tput sgr0)"; } || echo "$(tput cup `echo ${next_line}` 6)$(tput setaf 1)[ 4 ] ESB_11000$(tput sgr0)"
+
+		next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 5 ] Logic"
+		next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 6 ] Presentation"
+
+		color_check
+		ARRAY=("All" "Batch" "BPM" "ESB" "ESB 11000" "Logic" "Presentation")
+		exercise_chocie_list="all batch bpm esb10k esb11k logic presentation"
+		range=[0-6]
+		catch_user_input
+	elif [[ ${application_choice} =~ ^(1|2)$ ]]; then
+		exercise_task=all
+	elif [[ ${application_choice} = 3 ]]; then
+		next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] All"
+		adapt_colors 'Server'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 1 ] Server$(tput sgr0)"
+		next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 2 ] Client"
+		adapt_colors 'Supervisor'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 3 ] Supervisor$(tput sgr0)"
+		adapt_colors 'Watcher'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 4 ] Watcher$(tput sgr0)"
+
+		color_check
+		ARRAY=("All" "Server" "Client" "Supervisor" "Watcher")
+		exercise_chocie_list="all server client supervisor watcher"
+		range=[0-4]
+		catch_user_input
+	fi
+elif [[ ${environment_choice^^} = 'DPS' ]]; then
+	SUFFIX=$(grep ^DPS_SIDS ~/bin/servers.arr | awk '{print $2}' | cut -d'_' -f2)
+
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] DPS Management"
+	show_AT_statement 'AT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 1 ]$(tput sgr0) Information about current release"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 2 ]$(tput sgr0) Environment architecture"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 3 ]$(tput sgr0) Hostname and DNS information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 4 ]$(tput sgr0) Network information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 5 ]$(tput sgr0) Logging information"
+	show_AT_statement 'EXIT_STAT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput sgr0)$(tput bold)$(tput setaf 4)For EXIT press 6$(tput sgr0)$(tput el)"
+
+	extract_application_list="dps_manage architecture information_about_release hostname_info network_info user_info exit_program"
+	ARRAY=("DPS Management" "Information about current release" "Environment architecture" "Hostname and DNS information" "Network information" "Logging information" "EXIT")
+	range=[0-6]; range_value=[0-6]
+	catch_user_input_main; GET_CURRENT_LINE=${next_line}
+
+	if [[ ${application_choice} = 0 ]]; then
+		next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] All"
+		next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 1 ] RAT_${SUFFIX}"
+		next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 2 ] NOC_${SUFFIX}"
+
+		color_check
+		ARRAY=("All" "RAT_${SUFFIX}" "NOC_${SUFFIX}")
+		exercise_chocie_list="all RAT_${SUFFIX} NOC_${SUFFIX}"
+		range=[0-2]
+		catch_user_input
+	fi
+elif [[ ${environment_choice^^} = 'TUM' ]]; then
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] TUM Management"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 1 ] ZooKeeper Management"
+	show_AT_statement 'AT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 2 ]$(tput sgr0) Information about current release"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 3 ]$(tput sgr0) Environment architecture"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 4 ]$(tput sgr0) Hostname and DNS information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 5 ]$(tput sgr0) Network information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 6 ]$(tput sgr0) Logging information"
+	show_AT_statement 'EXIT_STAT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput sgr0)$(tput bold)$(tput setaf 4)For EXIT press 7$(tput sgr0)$(tput el)"
+
+	extract_application_list="tum_manage zk_manage architecture information_about_release hostname_info network_info user_info exit_program"
+	ARRAY=("TUM Management" "ZooKeeper Management" "Information about current release" "Environment architecture" "Hostname and DNS information" "Network information" "Logging information" "EXIT")
+	range=[0-7]; range_value=[0-7]
+	catch_user_input_main; GET_CURRENT_LINE=${next_line}
+
+	if [[ ${application_choice} = 0 ]]; then
+		next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] All"
+		adapt_colors 'TUM'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 1 ] CAS"
+		adapt_colors 'TUM'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 2 ] Httpd"
+		adapt_colors 'TUM'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 3 ] RestAPI"
+
+		color_check
+		ARRAY=("All" "CAS" "Httpd" "RestAPI")
+		exercise_chocie_list="all cas httpd rest-api"
+		range=[0-3]
+		catch_user_input
+	elif [[ ${application_choice} = 1 ]]; then
+		exercise_task=client
+	fi
+elif [[ ${environment_choice^^} = 'BPC' ]]; then
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] BPC Management"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 1 ] ZooKeeper Management"
+	show_AT_statement 'AT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 2 ]$(tput sgr0) Information about current release"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 3 ]$(tput sgr0) Environment architecture"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 4 ]$(tput sgr0) Hostname and DNS information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 5 ]$(tput sgr0) Network information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 6 ]$(tput sgr0) Logging information"
+	show_AT_statement 'EXIT_STAT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput sgr0)$(tput bold)$(tput setaf 4)For EXIT press 7$(tput sgr0)$(tput el)"
+
+	extract_application_list="bpc_manage zk_manage architecture information_about_release hostname_info network_info user_info exit_program"
+	ARRAY=("BPC Management" "ZooKeeper Management" "Information about current release" "Environment architecture" "Hostname and DNS information" "Network information" "Logging information" "EXIT")
+	range=[0-7]; range_value=[0-7]
+	catch_user_input_main; GET_CURRENT_LINE=${next_line}
+
+	if [[ ${application_choice} = 0 ]]; then
+		next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] All"
+		adapt_colors 'BPC'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 1 ] Loader"
+		adapt_colors 'BPC'; next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${COLOR_CHECK})[ 2 ] RestAPI"
+
+		color_check
+		ARRAY=("All" "Loader" "RestAPI")
+		exercise_chocie_list="all loader restapi"
+		range=[0-2]
+		catch_user_input
+	elif [[ ${application_choice} = 1 ]]; then
+		exercise_task=client
+	fi
+elif [[ ${environment_choice^^} = 'AIF' ]]; then
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] AIF Management"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 1 ] ZooKeeper Management"
+	show_AT_statement 'AT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 2 ]$(tput sgr0) Information about current release"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 3 ]$(tput sgr0) Environment architecture"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 4 ]$(tput sgr0) Hostname and DNS information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 5 ]$(tput sgr0) Network information"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)$(tput setaf ${LABEL_COLOR})[ 6 ]$(tput sgr0) Logging information"
+	show_AT_statement 'EXIT_STAT'
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput sgr0)$(tput bold)$(tput setaf 4)For EXIT press 7$(tput sgr0)$(tput el)"
+
+	extract_application_list="aif_manage zk_manage architecture information_about_release hostname_info network_info user_info exit_program"
+	ARRAY=("AIF Management" "ZooKeeper Management" "Information about current release" "Environment architecture" "Hostname and DNS information" "Network information" "Logging information" "EXIT")
+	range=[0-7]; range_value=[0-7]
+	catch_user_input_main; GET_CURRENT_LINE=${next_line}
+
+	if [[ ${application_choice} = 0 ]]; then
+		exercise_task=all
+	elif [[ ${application_choice} = 1 ]]; then
+		exercise_task=client
+	fi
+elif [[ ${environment_choice^^} = 'SYS' ]]; then
+	while [[ ! $sys_task =~ ^(start|stop|status|restart)$ ]]; do
+		(( count++ )); [[ ${count} -gt 1 ]] && tput cuu 0 && tput el # move cursor up #0 lines and clear line (start, when first input was wrong)
+		read -p "$(tput cup `echo ${next_line}` 4)Enter task choice (e.g. stop, start, status, restart) $(tput sgr0)" sys_task
+	done
+	echo "$(tput cup `echo ${next_line}` 4)$(tput el)$(tput rev) CHOSEN TASK $(tput sgr0)$(tput bold)$(tput cuf 19) ${sys_task^^}$(tput sgr0)$(tput el)"
+	next_line=$[${next_line}+2]; read -sp "$(tput cup `echo ${next_line}` 4)Enter passphrase for system administration $(tput sgr0)" sys_passphrase
+	tput el1; applications_startup ${sys_task} ${SHOW_ENV_NAME^^} ${sys_passphrase}
+	exit $?
+fi
+
+[[ ${extract_application} = 'exit_program' ]] && { printf "\033c"; exit 0; } # exit program and skip rest of code
+
+#--------------------------------------------------------------------#
+#----------------------- PARAMETERS - TASK --------------------------#
+#--------------------------------------------------------------------#
+
+if [[ ${environment_choice^^} = 'CRM' && ${application_choice} = [0-3] ]] || [[ ${environment_choice^^} = 'CPM' && ${application_choice} = [0-3] ]] || \
+	[[ ${environment_choice^^} = 'DPS' && ${application_choice} = 0 ]] || [[ ${environment_choice^^} =~ ^(BPC|TUM|AIF)$ && ${application_choice} = [0-1] ]]; then
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput rev) TASK MENU $(tput sgr0)"; GET_CURRENT_LINE=${next_line}
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] Start"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 1 ] Stop"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 2 ] Restart"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 3 ] Status"
+
+	next_line=$[${next_line}+2]
+	while [[ ! $task_choice =~ ^[0-3]$ ]]; do
+		read -p "$(tput bold)$(tput cup `echo ${next_line}` 4)Enter task choice [0-3] $(tput sgr0)" task_choice
+	done
+
+	task_choice_list="start stop restart status"
+	choice_array=($task_choice_list)
+	chosen_task="${choice_array[`echo ${task_choice}`]}"
+	ARRAY=("Start" "Stop" "Restart" "Status")
+	store_line "CHOSEN TASK" "task_choice" "19"
+fi
+
+#--------------------------------------------------------------------#
+#------------------------ RANGE ACTIVITIES --------------------------#
+#--------------------------------------------------------------------#
+
+# display settings only when environment type equals chosen type
+if [[ ${SHOW_ENV_TYPE} == ${environment_choice^^} ]]; then
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput rev) ACTIVITIES RANGE $(tput sgr0)"; GET_CURRENT_LINE=${next_line}
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] Current node"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 1 ] Local and remote nodes"
+
+	next_line=$[${next_line}+2]
+	while [[ ! ${node_activities} =~ ^[0-1]$ ]]; do
+		read -p "$(tput bold)$(tput cup `echo ${next_line}` 4)Enter activities range choice [0-1] $(tput sgr0)" node_activities
+	done
+
+	task_choice_list="current remote"
+	activities_array=($task_choice_list)
+	activities_range="${activities_array[`echo ${node_activities}`]}"
+	ARRAY=("Current node" "Local and remote nodes")
+	store_line "CHOSEN ACTIVITIES RANGE" "node_activities" "7"
+fi
+
+#--------------------------------------------------------------------#
+#--------------------- ADDITIONAL PARAMETERS ------------------------#
+#--------------------------------------------------------------------#
+
+# display settings only when environment type equals chosen type
+if [[ ${extract_application} =~ ^(es_manage|rmq_manage)$ ]]; then
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 4)$(tput rev) ADDITIONAL PARAMETER $(tput sgr0)"; GET_CURRENT_LINE=${next_line}
+	next_line=$[${next_line}+2]; echo "$(tput cup `echo ${next_line}` 6)[ 0 ] Performance monitor"
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 6)[ 1 ] No additional switch"
+
+	next_line=$[${next_line}+2]
+	while [[ ! ${additional_parameter} =~ ^[0-1]$ ]]; do
+		read -p "$(tput bold)$(tput cup `echo ${next_line}` 4)Enter additional parameter choice [0-1] $(tput sgr0)" additional_parameter
+	done
+
+	additional_choice_list="--performance"
+	activities_array=($additional_choice_list)
+	additional_choice_list_range="${activities_array[`echo ${additional_parameter}`]}"
+	ARRAY=("Performance monitor")
+	store_line "CHOSEN ADDITIONAL SWITCH" "additional_parameter" "6"
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+([[ ${extract_application} ]] && [[ ${exercise_task} ]] && [[ ${chosen_task} ]]) && TASK="${extract_application} ${exercise_task} ${chosen_task} ${SHOW_ENV_NAME^^}" || TASK="${extract_application}"
+[[ ${activities_range} == 'current' ]] && TASK+=" ${activities_range}" # concatenate strings (activities range - current or remote) - environments compatibility required
+[[ ${additional_choice_list_range} ]] && TASK+=" ${additional_choice_list_range}" # concatenate strings if additional parameter exists (script es_manage)
+
+IFS='' # for distinguishing " ", "\t" from "\n"
+next_line=$[${next_line}+2]; read -sp "$(tput cup `echo ${next_line}` 4)$(tput setaf 5)Type ENTER to confirm request processing: $(tput sgr0)$(tput bold)${TASK}$(tput sgr0) " -n 1 -r REPLY
+IFS=${RESTORE_IFS} # restore IFS definition
+
+if [[ $REPLY == "" ]]; then
+	echo "Called command at `date`: ${TASK}" >> ${SHOW_DEFAULT_PATH}/bin/log/mubemanage_`date +%Y.%m.%d`.log
+	tput clear
+	if [[ ${SHOW_ENV_TYPE} != ${environment_choice^^} ]]; then # case when environment types mismatch
+		for SERVER in "${SERVERS_ARRAY[@]}"; do
+			SERV=($SERVER)
+			[[ "${SERV[0]}" == "${SHOW_ENV_NAME^^}" && "${SERV[1]}" == ${environment_choice^^} && "${SERV[3]}" == "1" ]] && check_connection_and_execute || :
+		done
+	elif [[ ${LOCAL_HOST} != ${IP_ADDRESS} ]] && [[ ${SHOW_ENV_TYPE} == ${environment_choice^^} ]]; then # case when environment types are equal, but current IP is not primary
+		for SERVER in "${SERVERS_ARRAY[@]}"; do
+			SERV=($SERVER)
+			if [[ "${SERV[0]}" == "${SHOW_ENV_NAME^^}" && "${SERV[1]}" == ${environment_choice^^} && "${SERV[6]}" == ${IP_ADDRESS} ]]; then
+				APP_CHECK_REQUIRED_NODE=("rmq_manage.1" "es_manage.1|2" "bss_manage.1|2" "crm_manage.1|2" "jr_manage.1" "dps_manage.1" "tum_manage.1" "bpc_manage.1" "zk_manage.1|2")
+				for APP in ${APP_CHECK_REQUIRED_NODE[@]}; do
+					SCRIPT_NAME=$(echo ${APP} | cut -d'.' -f1); REQUIRED_NODE=$(echo ${APP} | cut -d'.' -f2)
+					if [[ "${extract_application}" == "${SCRIPT_NAME}" ]]; then
+						if [[ "${SERV[3]}" =~ ${REQUIRED_NODE} ]]; then
+							[[ ${PROTECT} == 'TRUE' ]] && { cat ~/bin/${extract_application}.enc | openssl aes-128-cbc -a -d -salt -k ${admin_access} > ~/bin/${extract_application}; chmod 700 ~/bin/${extract_application}; }
+							${TASK}
+						else
+							check_connection_and_execute
+						fi
+					fi
+				done
+			fi
+		done
+	else
+		[[ ${PROTECT} == 'TRUE' ]] && { cat ~/bin/${extract_application}.enc | openssl aes-128-cbc -a -d -salt -k ${admin_access} > ~/bin/${extract_application}; chmod 700 ~/bin/${extract_application} &>/dev/null; }
+		${TASK}
+	fi
+else
+	next_line=$[${next_line}+1]; echo "$(tput cup `echo ${next_line}` 4)$(tput setaf 1)Selected task was aborted by user$(tput sgr0)"
+	exit 1
+fi

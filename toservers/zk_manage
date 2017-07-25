@@ -1,0 +1,286 @@
+#!/bin/bash -
+# WARNING: script requires to work properly installed commands: jps and nc
+# ZooKeeper server by default uses 2181 transport port
+# switch 'components' refers to ZK components, except server, which must be managed separately (dependencies are nested in mubemanage and ZK_configuration scripts)
+# switch 'core' refers to all ZK components, expect client (used by ZK_configuration script)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="24.07.2017r."
+SCRIPT_VERSION="0.2.9"
+
+PID_FILE=~/bin/PID_files/$(basename $0).pid
+trap "rm -f -- '${PID_FILE}'" EXIT # remove PID file on exit
+
+source ~/bin/location_finder
+
+#--------------------------------------------------------------------#
+#------------------------- PARAMETERS -------------------------------#
+#--------------------------------------------------------------------#
+
+SERVER_NAME=${1,,}
+JOB=${2,,}
+ENV_NAME=${3^^}
+CUR_NAME=${4,,}
+
+PARENT_PID=$$
+NOERROR=`echo "${@: -1}"` # avoid getting errors, when using server_manage (--noerror)
+ERROR=0 # reset variables to original state
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nZooKeeper control tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [server]: all, components, client, core, server, supervisor, watcher"
+	echo "Available parameter [task]: start, stop, restart, debug, status"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [server] [task] [environment]")\n"
+	echo -e "$(colored "31" "[ WARNING ]") Switch 'components' refers to all ZooKeeper components expect server"
+	echo -e "$(colored "31" "[ WARNING ]") Switch 'core' refers to all ZooKeeper components expect client\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#----------------------- CHECK PARAMETERS ---------------------------#
+#--------------------------------------------------------------------#
+
+declare -a SERVER_NAME_ARR=("all" "components" "client" "core" "server" "supervisor" "watcher")
+declare -a JOB_ARR=("start" "stop" "restart" "status" "debug")
+
+if [[ -z $(echo "${SERVER_NAME_ARR[@]:0}" | grep -w ${SERVER_NAME}) ]]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong parameter. Please see below"
+	echo -e "$(colored "31" "[ WARNING ]") Available parameters [server]: all, components, client, core, server, supervisor, watcher\n"
+	exit 1
+elif [[ -z $(echo "${JOB_ARR[@]:0}" | grep -w ${JOB}) ]]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong parameter. Please see below."
+	echo -e "$(colored "31" "[ WARNING ]") Available parameters [task]: start, stop, restart, debug, status\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#-------------------------- DIRECTORY PATH --------------------------#
+#--------------------------------------------------------------------#
+
+PATH_DIR=${SHOW_DEFAULT_PATH}/config_management
+ZK_SERVER=${PATH_DIR}/zk-server-1/bin
+
+DIR_PATH_client=${PATH_DIR}/zk-client/
+DIR_PATH_supervisor=${PATH_DIR}/zk-supervisor/
+DIR_PATH_watcher=${PATH_DIR}/zk-file-watcher/
+
+JAR_FILE_client='zk-client-1.0.jar'
+JAR_FILE_supervisor='zk-supervisor-1.0.jar'
+JAR_FILE_watcher='zk-file-watcher-1.0.jar'
+
+#--------------------------------------------------------------------#
+#------------------------- KILLING FUNCTION -------------------------#
+#--------------------------------------------------------------------#
+
+function STOP_ZOOKEEPER() {
+	[[ "${SERVER_NAME}" =~ ^(all|components|client)$ ]] && KILLING ${JAR_FILE_client} client
+	if [[ "${IP_ADDRESS}" == "${LOCAL_HOST}" ]] && [[ ${SHOW_ENV_TYPE} == 'CRM' ]]; then
+		[[ "${SERVER_NAME}" =~ ^(all|components|core|watcher)$ ]] && KILLING ${JAR_FILE_watcher} watcher
+		[[ "${SERVER_NAME}" =~ ^(all|components|core|supervisor)$ ]] && KILLING ${JAR_FILE_supervisor} supervisor
+		[[ "${SERVER_NAME}" =~ ^(all|core|server)$ ]] && PERMISSIONS_DIRECTORIES && KILL_SERVER
+	fi
+}
+
+function KILL_SERVER() {
+	# when ZooKeeper is running it runs org.apache.zookeeper.server.quorum.QuorumPeerMain class
+	function ZK_STAT() { echo `$(which jps) -l | grep zookeeper | awk '{print $1}'`; }
+
+	if [[ $(ZK_STAT) ]]; then
+		echo -e "\n$(colored "34" "[ INFORMATION ]") Stopping ZooKeeper Server"
+		cd ${ZK_SERVER}; ./zkServer.sh stop
+    	sleep 15 # avoid incorrect messages after process termination
+
+    	[[ $(ZK_STAT) ]] && { echo -e "$(colored "31" "[ WARNING ]") ZooKeeper server is still runinng with PID: $(ZK_STAT). Terminating process."; kill -9 $(ZK_STAT); }
+    	echo -e "$(colored "32" "[ INFORMATION ]") ZooKeeper server stopped successfully"
+    else
+    	echo -e "$(colored "32" "[ INFORMATION ]") ZooKeeper server is not working currently"
+    fi
+}
+
+function KILLING() {
+	echo -e "\nStopping ZooKeeper: $(colored "34" "${2}") on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	VERYFI_PID=$(ps -fu `whoami` | grep [^]]$1 | awk '{printf "%s ", $2}')
+
+	[[ ${VERYFI_PID} ]] && \
+	{ echo -e "$(colored "32" "[ INFORMATION ]") Terminating processes with following PIDs: ${VERYFI_PID}"; kill -9 ${VERYFI_PID} > /dev/null 2>&1; sleep 15; } || \
+	echo -e "$(colored "32" "[ INFORMATION ]") Component is not currently working. Skipping shutdown process."
+}
+
+#--------------------------------------------------------------------#
+#------------------------ STARTING FUNCTION -------------------------#
+#--------------------------------------------------------------------#
+
+function START_ZOOKEEPER() {
+	if [[ "${IP_ADDRESS}" == "${LOCAL_HOST}" ]] && [[ ${SHOW_ENV_TYPE} == 'CRM' ]]; then
+		[[ "${SERVER_NAME}" =~ ^(all|core|server)$ ]] && PERMISSIONS_DIRECTORIES && START_SERVER
+		[[ "${SERVER_NAME}" =~ ^(all|components|core|supervisor)$ ]] && STARTING ${DIR_PATH_supervisor} ${JAR_FILE_supervisor} Supervisor
+		[[ "${SERVER_NAME}" =~ ^(all|components|core|watcher)$ ]] && STARTING ${DIR_PATH_watcher} ${JAR_FILE_watcher} Watcher
+	fi
+	[[ "${SERVER_NAME}" =~ ^(all|components|client)$ ]] && STARTING ${DIR_PATH_client} ${JAR_FILE_client} Client
+}
+
+function START_SERVER() {
+	echo -e "\nStarting $(colored "34" "ZooKeeper Server") on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	cd ${ZK_SERVER}; ./zkServer.sh start
+
+	ZK_STAT=`$(which jps) -l | grep zookeeper | awk '{print $1}'`	
+	[[ -n ${ZK_STAT} ]] && \
+	echo -e "$(colored "32" "[ INFORMATION ]") ZooKeeper server is runinng with PID: $(colored "35" "${ZK_STAT}")" || \
+	{ echo -e "$(colored "31" "[ CRITICAL ERROR ]") ZooKeeper server did not start properly"; exit 1; }
+}
+
+function STARTING() {
+	echo -e "\nStarting ZooKeeper: $(colored "34" "${3,,}") on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	[ ! -d $1 ] && { echo -e "$(colored "31" "[ CRITICAL ERROR ]") Directory $1 doesn't exist. Exiting."; exit 1; }
+
+	STATUS=$(ps -fu `whoami` | grep [^]]$2 | awk '{print $2}')
+	[ -n "${STATUS}" ] && \
+	echo -e "$(colored "32" "[ INFORMATION ]") $3 has already been started" || \
+	if [[ ${JOB} =~ ^(restart|start)$ ]]; then
+		cd $1; nohup java -jar $2 > /dev/null 2>&1 &
+		sleep 10
+	fi
+	
+	PID=$(ps -fu `whoami` | grep [^]]$2 | awk '{print $2}')
+	[[ ${PID} ]] && echo -e "$(colored "32" "[ INFORMATION ]") $3 started with PID: $(colored "35" "${PID}")" || \
+	{ echo -e "$(colored "31" "[ CRITICAL ERROR ]") $3 did not start properly"; exit 1; }
+}
+
+#--------------------------------------------------------------------#
+#------------------------- STATUS FUNCTION --------------------------#
+#--------------------------------------------------------------------#
+
+function STATUS_ZOOKEEPER() {
+	echo -e "\n$(colored "34" "Testing ZooKeeper components on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+
+	if [[ "${IP_ADDRESS}" == "${LOCAL_HOST}" ]] && [[ ${SHOW_ENV_TYPE} == 'CRM' ]]; then
+		[[ "${SERVER_NAME}" =~ ^(all|core|server)$ ]] && STATUS_SERVER Server
+		[[ "${SERVER_NAME}" =~ ^(all|components|core|supervisor)$ ]] && STATUS ${JAR_FILE_supervisor} Supervisor
+		[[ "${SERVER_NAME}" =~ ^(all|components|core|watcher)$ ]] && STATUS ${JAR_FILE_watcher} Watcher
+	fi
+	[[ "${SERVER_NAME}" =~ ^(all|components|client)$ ]] && STATUS ${JAR_FILE_client} Client
+
+	if [[ ${ERROR} -eq 1 ]]; then
+		echo -e "$(colored "31" "[ WARNING ]") ZooKeeper components $(colored "33" "not fully") started."
+		[[ ${NOERROR} != '--noerror' ]] && exit 1 || :
+		[[ ${JOB} != 'status' ]] && { ps -fu `whoami` | grep [^]]zk_manage | awk '{print $2}' | xargs kill -9; exit 1; }
+	fi
+}
+
+function get_process_parameters() {
+    stime=`ps -p $1 -o lstart= | awk '{print $2 $3}'` # start day
+    upwork=`ps -p $1 -o lstart= | awk '{print $4}'` # start time
+    cpu=`ps -p $1 -o %cpu= | awk '{print $1}'` # cpu load
+    memory=`ps -p $1 -o %mem= | awk '{print $1}'` # memory load
+    echo -e "PID: [ $(colored "35" "$(printf "%5d" $1)") ] Stime: [ $(colored "36" "$(printf "%5s" $stime)") $(colored "36" "$upwork") ]" \
+    "CPU: [ $(colored "31" "$(printf "%4s" $cpu)") ] PMEM: [ $(colored "33" "$(printf "%4s" $memory)") ] $component $(colored "32" "is responding")"
+}
+
+function STATUS_SERVER() {
+	local component=$1
+	$(which jps) -l | grep -v grep | grep -w zookeeper | awk '{print $1}' | while read PROCESS_PID; do get_process_parameters ${PROCESS_PID}; done
+	sleep 10 # wait to prevent incorrect states from server
+
+	# check third status of pipe (if equal none-zero than it means, that inquiry is not vaild)
+	if [[ "${PIPESTATUS[2]}" -eq 1 ]]; then
+		echo -e "Server is currently $(colored "31" "not working")"; ERROR=1
+	else
+		if type nc &>/dev/null; then
+			[[ `echo ruok | nc ${IP_ADDRESS} 2181 2>/dev/null` != 'imok' ]] && { echo -e "Server is not running in $(colored "31" "non-error") state"; ERROR=1; }
+			[[ `echo isro | nc ${IP_ADDRESS} 2181 2>/dev/null` != 'rw' ]] && { echo -e "Server is running in $(colored "31" "read-only") mode"; ERROR=1; }
+		else
+			echo -e "$(colored "31" "[ WARNING ]") Required 'nc' linux command is unavailable. Skipping ZooKeeper server status validation."
+		fi
+	fi
+}
+
+function STATUS() {
+	local component=$2
+	ps -fu `whoami` | grep -v grep | grep -P "(?=.*?$1)(?=.*?java)" | awk '{print $2}' | while read PROCESS_PID; do get_process_parameters ${PROCESS_PID}; done
+
+	# check fourth status of pipe (if equal none-zero than it means, that inquiry is not vaild)
+	[[ "${PIPESTATUS[3]}" -eq 1 ]] && { echo -e "$2 is currently $(colored "31" "not working")."; ERROR=1; }
+}
+
+#--------------------------------------------------------------------#
+#------------------------ DEBUGGING FUNCTION ------------------------#
+#--------------------------------------------------------------------#
+
+function DEBUG_ZOOKEEPER() {
+	[[ "${SERVER_NAME}" =~ ^(all|client)$ ]] && DEBUG ${DIR_PATH_client} ${JAR_FILE_client} Client
+	if [[ "${IP_ADDRESS}" == "${LOCAL_HOST}" ]] && [[ ${SHOW_ENV_TYPE} == 'CRM' ]]; then
+		[[ "${SERVER_NAME}" =~ ^(all|watcher)$ ]] && DEBUG ${DIR_PATH_watcher} ${JAR_FILE_watcher} Watcher
+		[[ "${SERVER_NAME}" =~ ^(all|supervisor)$ ]] && DEBUG ${DIR_PATH_supervisor} ${JAR_FILE_supervisor} Supervisor
+	fi
+}
+
+function DEBUG() {
+	echo -e "\nDebugging ZooKeeper: $3"
+	[ ! -d $1 ] && { echo -e "$(colored "31" "[ CRITICAL ERROR ]") Directory $1 doesn't exist. Exiting."; exit 1; }
+
+	STATUS=$(ps -fu `whoami` | grep [^]]$2 | grep $USER | awk '{print $2}')
+	[ -n "${STATUS}" ] && echo -e "$(colored "32" "[ INFORMATION ]") $3 has already been started" || \
+	java -Xdebug -Xrunjdwp:server=y,transport=dt_socket,address=4000,suspend=n -jar $1/$2
+}
+
+#--------------------------------------------------------------------#
+#--------------------------- PREREQUISITES --------------------------#
+#--------------------------------------------------------------------#
+
+# check if user links to proper environment
+if [ ${SHOW_ENV_NAME,,} != ${ENV_NAME,,} ]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong environment was definied during script induction."
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Current environment: ${SHOW_ENV_NAME^^}. Definied environment: ${ENV_NAME^^}.\n"
+	exit 1
+fi
+
+# checK if JAVA binaries are present
+[ $(which java) == "" ] && { echo -e "$(colored "31" "[ CRITICAL ERROR ]") Java was not definied properly in environment's configuration"; exit 1; }
+
+# check if another process is running in parallel
+if [[ "${JOB}" =~ ^(stop|restart|start)$ ]]; then
+    mkdir -p ~/bin/PID_files # create required folders
+    ([[ -f "${PID_FILE}" ]] && [[ `cat ${PID_FILE}` ]]) && echo -e "$(colored "31" "[ WARNING ]") Another process with `cat ${PID_FILE}` PID is already written to $(basename $0).pid lockfile on ${IP_ADDRESS} ( ${HOSTNAME} )"
+    for CHECK_ANOTHER_PID in $(pidof -x $(basename $0)); do
+    	if [ ${CHECK_ANOTHER_PID} != ${PARENT_PID} ]; then
+    		echo -e "$(colored "31" "[ WARNING ]") Terminating already running process with ${CHECK_ANOTHER_PID} PID on ${IP_ADDRESS} ( ${HOSTNAME} )"
+            kill -9 ${CHECK_ANOTHER_PID} &>/dev/null # kill silently
+        fi
+    done
+    echo ${PARENT_PID} > "${PID_FILE}"
+fi
+
+function PERMISSIONS_DIRECTORIES() {
+    chmod 764 ${ZK_SERVER}/zkServer.sh # add permission to ZK server management script
+    mkdir -p ${PATH_DIR}/logs/zk-server-1 ${PATH_DIR}/zk-server-1/data/zk-server-1 # create needed folders
+}
+
+#--------------------------------------------------------------------#
+#-------------------------- FUNCTIONS CALL --------------------------#
+#--------------------------------------------------------------------#
+
+# create tasks list if was definied switch requiring serveral basic tasks
+[[ "${JOB}" == 'restart' ]] && PROCESS_TASK="stop start status" || PROCESS_TASK="${JOB}"
+
+for TASK in ${PROCESS_TASK}; do "${TASK^^}"_ZOOKEEPER; done

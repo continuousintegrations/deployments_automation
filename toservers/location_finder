@@ -1,0 +1,75 @@
+#!/bin/bash -
+# location tool by adam.chalat@comarch.com
+# build_date=04.07.2017
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+IP_ADDRESS=$(ip addr | grep 'state UP' -A2 | tail -n1 | awk '{print $2}' | cut -f1 -d'/') # get IP address of current host
+
+#--------------------------------------------------------------------#
+#---------------------------- FUNCTIONS -----------------------------#
+#--------------------------------------------------------------------#
+
+function colored() { echo "\e[$1m$2\e[0m"; } # $1 color number, $2 text
+
+#--------------------------------------------------------------------#
+#---------------------------- READ ARRAY ----------------------------#
+#--------------------------------------------------------------------#
+
+# search for declared ENV_LIST key and list entries starting only with with definied prefixes and having also only seven columns
+# referece to array is causing formation of empty charactera at the beginning of lines, starting from second
+readarray ENVRIONMENT_ARRAY <<< "$(for SORT_ENV in `awk '$1 == "ENV_LIST" { print }' ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}' | tr ',' ' '`; do
+	awk -v env_name="${SORT_ENV}" '$1 == env_name { print }' ~/bin/servers.arr | awk '(NF==7)'; done)"
+
+#--------------------------------------------------------------------#
+#--------------------------- SERVER SEARCH --------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${ENVRIONMENT_ARRAY[@]}"; do
+	SERV=($SERVER)
+	if [[ "${SERV[6]}" == "${IP_ADDRESS}" ]] && [[ "${SERV[4]}" == "`whoami`" ]]; then
+		SHOW_ENV_NAME=${SERV[0]} # environment name
+		SHOW_ENV_TYPE=${SERV[1]} # node type (BPC, CPM, CRM, DPS, TUM, QUORUM)
+		SHOW_DEFAULT_PATH=${SERV[5]} # default software path
+
+		SYSTEM_VERSION=$(grep ^'SYSTEM_VERSION' ~/bin/servers.arr | awk '{print $2}') # environment release: 7.0, 7.1, 7.2, 7.3
+		LOCAL_HOST=$(grep -P "(?="${SHOW_ENV_NAME}".*)(?=.*"${SHOW_ENV_TYPE}".*)" <<< "${ENVRIONMENT_ARRAY[@]}" | awk '$4 == /1/ { print $7 }') # name of main (local) host
+		REMOTE_HOST_NAME=$(grep -P "(?="${SHOW_ENV_NAME}".*)(?=.*"${SHOW_ENV_TYPE}".*)" <<< "${ENVRIONMENT_ARRAY[@]}" | awk '$4 !~ /1/ { printf "%s ", $3 }') # name of remote hosts
+		REMOTE_HOST=$(grep -P "(?="${SHOW_ENV_NAME}".*)(?=.*"${SHOW_ENV_TYPE}".*)" <<< "${ENVRIONMENT_ARRAY[@]}" | awk '$4 !~ /1/ { print }' | wc -l) # number of remote hosts
+		break # break after first occurrence (collision with duplicated IP addresses)
+	fi
+done
+
+#--------------------------------------------------------------------#
+#--------------------- FIXED ENVIRONMENT ARRAY ----------------------#
+#--------------------------------------------------------------------#
+
+# matrix is pre-sorted for the current environment
+readarray SERVERS_ARRAY <<< "$(for SORT_ENV in `awk '$1 == "ENV_LIST" { print }' ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}' | tr ',' ' '`; do
+	awk -v env_name="${SORT_ENV}" '$1 == env_name { print }' ~/bin/servers.arr | awk '(NF==7)' | grep ^${SHOW_ENV_NAME} | awk '$2 ~ /CPM|QUORUM|CRM|BPC|TUM|DPS|AIF/ {print}' | sort -k2; done)"
+
+#--------------------------------------------------------------------#
+#-------------------------- VALIDATION ------------------------------#
+#--------------------------------------------------------------------#
+
+for CHECK_SYS_VAR in '${SHOW_ENV_NAME}' '${SHOW_ENV_TYPE}' '${SHOW_DEFAULT_PATH}'; do
+	eval CHECK_SYS_TEMP=${CHECK_SYS_VAR}
+	if [[ -z ${CHECK_SYS_TEMP} ]]; then
+		echo -e "$(colored "31" "[ WARNING ]") Variable ${CHECK_SYS_VAR} was not loaded properly from servers.arr configuration file"
+		echo -e "$(colored "31" "[ WARNING ]") Error may be critical for management and deployment scripts (please contact ITOPS department)"
+		exit 1
+	fi
+done

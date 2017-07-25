@@ -1,0 +1,146 @@
+#!/bin/bash -
+# crm liquibase changeset tool by adam.chalat@comarch.com
+# softlinks are generated - it was necessary to adjust the configuration contained in build.xml
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+source ~/bin/location_finder
+
+BUILD_DATE="14.07.2017r."
+SCRIPT_VERSION="0.1.4"
+
+#--------------------------------------------------------------------#
+#---------------------------- PATH ----------------------------------#
+#--------------------------------------------------------------------#
+
+LB_HOME="${SHOW_DEFAULT_PATH}/liquibase"
+LIQUILOGS="${LB_HOME}/liquiLogs"
+LB_PATCHES="${LB_HOME}/changes"
+LIQUIBASE_DIRECTORY=Liquibase_installation_`date +%Y-%m-%d`
+EXT_DIR=${LB_PATCHES}/${LIQUIBASE_DIRECTORY}
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 1 ]; then
+	echo -e "\nCRM liquibase upgrade tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [schema]: all, crm, liferay, bpm, bs, esb"
+	echo -e "Available parameter [options]: --nodelete (uses previously extracted liquibase binaries - optionally)"
+	echo -e "$(colored "31" "[ WARNING ]") Script needs in directory ${EXT_DIR} file 'packages_crm' with listed liquibases"
+	echo -e "$(colored "31" "[ WARNING ]") For projects which use cumulative database changes mendatory is parameter pointing boundary version\n"
+	echo -e "Usage: $(colored "34" "upgrade_crm_db [schema] [options]")"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- PARAMETERS -------------------------------#
+#--------------------------------------------------------------------#
+
+SCHEMA=$1 # choose schema which should be installed
+OPTION=$2 # avoid overwriting liquibase binaries
+
+for PARAMETER in "$@"; do
+	[[ ${PARAMETER} =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$ ]] && \
+	{ echo -e "$(colored "32" "[ INFORMATION ]") Found additional parameter: ${PARAMETER} (performing changesets installation for multiple liquibases)"; PARAMETER=${PARAMETER}; break; }
+done
+
+#--------------------------------------------------------------------#
+#-------------------------- FUNCTIONS -------------------------------#
+#--------------------------------------------------------------------#
+
+function CRM_LIQUIBASE() {
+	if [[ -d "${PACKAGE}/$2" ]]; then
+		echo "-------------------------------------------------------"
+		echo -e "CRM liquibase:" $(colored "32" "${CRM_VERSION}")
+		echo "-------------------------------------------------------"
+		echo -e "Schema: $(colored "35" "$1") | Branch: $(colored "35" "`basename ${PACKAGE}`")"
+		echo "-------------------------------------------------------"
+		echo -e "Directory: $(colored "34" "${PACKAGE}/$2")"
+		echo "-------------------------------------------------------"
+
+		TIME_FILE=`date '+%Y%m%d-%H%M%S'`
+		${LB_HOME}/bin/ant -buildfile ${LB_HOME}/build.xml $2-upgrade-context -Dupgrade.version=${CRM_VERSION} -Dcontext=upgrade -Dfile.encoding=UTF8 2>&1 | \
+		tee -a ${LIQUILOGS}/${LIQUIBASE_DIRECTORY}/$2_upgrade_context-$CRM_VERSION_${TIME_FILE}.log
+
+		if grep 'Build failed\|BUILD FAILED' ${LIQUILOGS}/${LIQUIBASE_DIRECTORY}/$2_upgrade_context-$CRM_VERSION_${TIME_FILE}.log; then 
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") Database upgrade encountered errors during $1 schema upgrade"
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") The correctness of the previously installed changes and the database content should be verified"
+			exit 1
+		fi
+	else
+		echo -e "$(colored "31" "[ WARNING ]") Changes for $1 schema were not delivered with ${CRM_VERSION} package"
+	fi
+}
+
+function CRM_UPGRADE() {
+	# crm schemas definition: CRM schema name and upgrade context
+	[[ ${SCHEMA} =~ ^(all|crm)$ ]] && CRM_LIQUIBASE "CRM" "crm" 
+	[[ ${SCHEMA} =~ ^(all|liferay)$ ]] && CRM_LIQUIBASE "Liferay" "liferay"
+	[[ ${SCHEMA} =~ ^(all|bpm)$ ]] && CRM_LIQUIBASE "BPM" "bpm"
+	[[ ${SCHEMA} =~ ^(all|esb)$ ]] && CRM_LIQUIBASE "ESB" "esb"
+	
+	# bss schemas definition: BS schema name and upgrade context
+	[[ ${SCHEMA} =~ ^(all|bs)$ ]] && CRM_LIQUIBASE "BS" "bs"
+	[[ ${SCHEMA} =~ ^(all|pi)$ ]] && CRM_LIQUIBASE "PI" "pi"
+	[[ ${SCHEMA} =~ ^(all|bs2)$ ]] && CRM_LIQUIBASE "BS2" "bs2"
+}
+
+#--------------------------------------------------------------------#
+#------------------------ FUNCTION CALL  ----------------------------#
+#--------------------------------------------------------------------#
+
+while read -r line; do
+	CRM_VERSION=`echo ${line%.*} | sed '$s/.tar//g'` # variable is used further in function CRM_LIQUIBASE (remove first part of extension and then second if equal .tar)
+	# remove softlinks and liquibase directory (unpacked archives) regardless of the result of the upgrade
+	trap "find ${EXT_DIR} -maxdepth 1 -mindepth 1 -type d -exec rm -rf {} \;; find ${LB_PATCHES} -maxdepth 1 -mindepth 1 -type l -exec rm {} \;" 0 1 2 3 15
+
+	[[ ! -f ${EXT_DIR}/${line} ]] && { echo -e "$(colored "31" "[ CRITICAL ERROR ]") There is missing ${line} database package in location ${EXT_DIR}"; exit 1; } # check if database package is present in working directory
+	mkdir -p ${LIQUILOGS}/${LIQUIBASE_DIRECTORY}  # liquibase logs directory (parent directory is created by crm_liquibase)
+
+	if [ "${OPTION}" != "--nodelete" ]; then # escape condition in order to not unpack archive
+		if [ -d ${EXT_DIR}/${line%.tar.gz} ] || [ -d ${EXT_DIR}/${line%.zip} ]; then  # removing repeated liquibases
+			echo -e "$(colored "32" "[ INFORMATION ]") Removing previously extracted package: `[ -d ${EXT_DIR}/${line%.tar.gz} ] && echo $(colored "32" "${line%.tar.gz}")` `[ -d ${EXT_DIR}/${line%.zip} ] && echo $(colored "32" "${line%.zip}")`"
+			[[ ${EXT_DIR} ]] && rm -rf ${EXT_DIR}/{${line%.tar.gz},${line%.zip}}
+		fi
+
+		echo -e "$(colored "32" "[ INFORMATION ]") Extracting liquibase binaries: $(colored "34" "${CRM_VERSION}")"
+		if [[ ${line} =~ '.tar.gz'$ ]]; then
+			tar -xzf ${EXT_DIR}/${line} -C ${EXT_DIR}
+			mv ${EXT_DIR}/`tar -ztvf ${EXT_DIR}/${line} | head -1 | awk '{print $6}' | sed 's/\/$//'` ${EXT_DIR}/${line%.tar.gz} # names unification
+			# generate list of all branches included in liquibase and remove those which are below master of each branch
+			LIST=$(tar -tf ${EXT_DIR}/$line | awk -F"/" '{print $1}' | uniq | grep -w "[[:digit:]]*\.[[:digit:]]*\.[[:digit:]]*\.[[:digit:]]*" | sort -rV | sed "/${PARAMETER}/q" 2>/dev/null | sort -V | awk -v var="${EXT_DIR}" '$0=var"/"$0')
+		elif [[ ${line} =~ '.zip'$ ]]; then
+			HEAD_FOLDER=`zipinfo -1 ${EXT_DIR}/${line} | head -1`
+			if [ $HEAD_FOLDER = `echo ${line} | sed 's/Liquibase-//' | sed 's/-.*//' | awk '{print $0"/"}'` ]; then # compare head folder of archive and name of liquibase (leave only the middle name)
+				unzip ${EXT_DIR}/${line} -d ${EXT_DIR} &>/dev/null
+				mv ${EXT_DIR}/$HEAD_FOLDER ${EXT_DIR}/${line%.zip}
+			else
+				unzip ${EXT_DIR}/${line} -d ${EXT_DIR}/${line%.zip} &>/dev/null
+			fi
+		fi
+	fi
+
+	while read PACKAGE; do
+		ln -s ${PACKAGE} ${LB_PATCHES}/${CRM_VERSION} # create softlink to liquibase due to the indication in the build.xml
+		CRM_UPGRADE
+		[ -L ${LB_PATCHES}/${CRM_VERSION} ] && rm -f ${LB_PATCHES}/${CRM_VERSION} # check if softlink exists and remove it (trap remove the last one in loop)
+	done <<< "${LIST:-${EXT_DIR}/${CRM_VERSION}}"
+
+	echo -e "$(colored "32" "[ INFORMATION ]") Database changes included in ${line} have been implemented successfully"
+done < ${EXT_DIR}/packages_crm

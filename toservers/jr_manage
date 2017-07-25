@@ -1,0 +1,160 @@
+#!/bin/bash -
+# JackRabbit control tool by adam.chalat@comarch.com
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+PID_FILE=~/bin/PID_files/$(basename $0).pid
+trap "rm -f -- '$PID_FILE'" EXIT # remove PID file on exit
+
+source ~/bin/location_finder
+
+BUILD_DATE="04.07.2017r."
+SCRIPT_VERSION="0.2.8"
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ -z "$2" ] || [ "$1" = "help" ]; then
+    echo -e "\nZooKeeper control tool by $(colored "32" "adam.chalat@comarch.com")"
+    echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+    echo "This script requires below parameters:"
+    echo "Available parameter [server]: all"
+    echo "Available parameter [task]: start, stop, restart, status"
+    echo -e "Available parameter [environment]: `grep ^ENV_LIST ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`\n"
+    echo -e "Usage: $(colored "34" "$(basename $0) [server] [task] [environment]")\n"
+    exit 1
+fi
+
+#--------------------------------------------------------------------#
+#---------------------------- PARAMETERS ----------------------------#
+#--------------------------------------------------------------------#
+
+SERVER_NAME=${1,,}
+JOB=${2,,}
+ENV_NAME=${3^^}
+PARENT_PID=$$
+
+#--------------------------------------------------------------------#
+#-------------------------- JACKRABBIT PID --------------------------#
+#--------------------------------------------------------------------#
+
+function get_jackrabbit_pid { JACKRABBIT_PID=`ps -fu ${USER} | grep -v grep | grep -P "(?=.*?jackrabbit-standalone.*.jar)(?=.*?java)(?=.*?10900)" | awk '{print $2}'`; }
+
+#--------------------------------------------------------------------#
+#------------------------ RESTARTING FUNCTION -----------------------#
+#--------------------------------------------------------------------#
+
+function JR_STOP() {
+    if [ "${JOB}" = "stop" ]; then
+        if [ -z "${JACKRABBIT_PID}" ]; then
+            echo -e "$(colored "32" "[ INFORMATION ]") JackRabbit is already stopped"
+            exit 0
+        else
+            echo "Stopping JackRabbit on ${IP_ADDRESS} ( ${HOSTNAME} )"
+            kill ${JACKRABBIT_PID}
+            sleep 45
+            get_jackrabbit_pid
+            if [ -z "${JACKRABBIT_PID}" ]; then
+                echo -e "$(colored "32" "[ INFORMATION ]") JackRabbit was successully stopped"
+                exit 0
+            else
+                echo -e "$(colored "31" "[ WARNING ]") Jackrabbit is still working. Exiting."
+                exit 1
+            fi
+        fi
+    fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------ RESTARTING FUNCTION -----------------------#
+#--------------------------------------------------------------------#
+
+function JR_START() {
+    if [ "${JOB}" = "start" ]; then
+        if [ -z "${JACKRABBIT_PID}" ]; then
+            echo "Starting JackRabbit on ${IP_ADDRESS} ( ${HOSTNAME} )"
+            cd ${SHOW_DEFAULT_PATH}/servers/image_store
+            nohup java -Dlog_dir=../../../logs/image_store_log -jar jackrabbit-standalone-2.8.0.jar --port 10900 > jackrabbit.log 2>&1 &
+            sleep 60
+            get_jackrabbit_pid
+            if [ -z "${JACKRABBIT_PID}" ]; then
+                echo -e "$(colored "31" "Failed to start JackRabbit. Exiting.")"
+                exit 1
+            fi
+            echo -e "JackRabbit is started with PID: $(colored "34" "${JACKRABBIT_PID}")"
+        else
+            echo -e "$(colored "31" "[ WARNING ]") JackRabbit is already running with PID: $(colored "34" "${JACKRABBIT_PID}")"
+        fi
+        exit 0
+    fi
+}
+
+#--------------------------------------------------------------------#
+#-------------------------- STATUS FUNCTION -------------------------#
+#--------------------------------------------------------------------#
+
+function JR_STATUS() {
+    if [ "${JOB}" = "status" ]; then
+        echo -e "\n$(colored "34" "Testing JackRabbit on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+        if [ -z "${JACKRABBIT_PID}" ]; then
+            echo -e "JackRabbit is $(colored "31" "not running")"
+            [[ "${@: -1}" != '--noerror' ]] && exit 1 || :
+        else
+            stime=`ps -p ${JACKRABBIT_PID} -o lstart= | awk '{print $2 $3}'` # start day
+            upwork=`ps -p ${JACKRABBIT_PID} -o lstart= | awk '{print $4}'` # start time
+            cpu=`ps -p ${JACKRABBIT_PID} -o %cpu= | awk '{print $1}'` # cpu load
+            memory=`ps -p ${JACKRABBIT_PID} -o %mem= | awk '{print $1}'` # memory load
+            echo -e "PID: [ $(colored "35" "$(printf "%5d" $JACKRABBIT_PID)") ] Stime: [ $(colored "36" "$stime") $(colored "36" "$upwork") ]" \
+            "CPU: [ $(colored "31" "$(printf "%4s" $cpu)") ] PMEM: [ $(colored "33" "$(printf "%4s" $memory)") ] JackRabbit $(colored "32" "is running")"
+        fi
+    fi
+}
+
+#--------------------------------------------------------------------#
+#--------------------------- PREREQUISITES --------------------------#
+#--------------------------------------------------------------------#
+
+# check if user links to proper environment
+if [ ${SHOW_ENV_NAME,,} != ${ENV_NAME,,} ]; then
+    echo -e "\n$(colored "31" "[ WARNING ]") Wrong environment was definied during script induction."
+    echo -e "$(colored "31" "[ WARNING ]") Current environment: ${SHOW_ENV_NAME^^}. Definied environment: ${ENV_NAME^^}.\n"
+    exit 1
+fi
+
+# check if another process is running in parallel
+if [[ "${JOB}" =~ ^(stop|restart|start)$ ]]; then
+    mkdir -p ~/bin/PID_files # create required folders
+    ([[ -f "$PID_FILE" ]] && [[ `cat $PID_FILE` ]]) && echo -e "$(colored "31" "[ WARNING ]") Another process with `cat $PID_FILE` PID is already written to $(basename $0).pid lockfile on ${IP_ADDRESS} ( ${HOSTNAME} )"
+    for CHECK_ANOTHER_PID in $(pidof -x $(basename $0)); do
+        if [ ${CHECK_ANOTHER_PID} != ${PARENT_PID} ]; then
+            echo -e "$(colored "31" "[ WARNING ]") Terminating already running process with ${CHECK_ANOTHER_PID} PID on ${IP_ADDRESS} ( ${HOSTNAME} )"
+            kill -9 ${CHECK_ANOTHER_PID} &>/dev/null # kill silently
+        fi
+    done
+    echo ${PARENT_PID} > "${PID_FILE}"
+fi
+
+get_jackrabbit_pid # acquisition of app PID
+
+#--------------------------------------------------------------------#
+#-------------------------- FUNCTIONS CALL --------------------------#
+#--------------------------------------------------------------------#
+
+# create tasks list if was definied switch requiring serveral basic tasks
+[[ "${JOB}" == 'restart' ]] && PROCESS_TASK="stop start status" || PROCESS_TASK="${JOB}"
+
+for TASK in ${PROCESS_TASK}; do JR_"${TASK^^}"; done

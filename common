@@ -1,0 +1,261 @@
+#!/bin/bash -
+# build_date=24.07.2017
+# source file for executed scripts (shared functions and variables)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------------- FUNCTIONS -----------------------------#
+#--------------------------------------------------------------------#
+
+function colored() { echo "\e[$1m$2\e[0m"; } # colored output ($1 - color number, $2 - text message)
+function stop_deployment() { TITLE="Prerequisite was not fulfilled (user interaction is essential)"; MESSAGE="${1}\nInduction script: $(basename $0)"; COLOUR='warning'; send_to_slack &>/dev/null; exit 1; }
+
+function load_keys_and_variables() {
+	function obtain_ssh_agent_parameters() {
+        AGENT_PID=$(ps -fu ${BAMBOO_USER} | grep ssh-agent | grep -v grep | awk '{print $2}') # obtaining ssh agent's PID
+        AGENT_WORKING_DIRECTORY=`find /tmp/ -name "agent.$((AGENT_PID-1))" 2>&-` # ssh agent working directory
+    }
+
+    # load variables and run ssh-agent when private key is encrypted
+    if grep -q ENCRYPTED ~/.ssh/id_rsa; then
+        BAMBOO_USER=$(whoami) # store implementation username, becauser variable USER is overwritten during loop iteration
+        # SSH agent load is moved to .bash_profile due to willingness to readiness of the environment
+        if [[ $(ps -fu ${BAMBOO_USER} | grep 'ssh-agent' | grep -v grep | awk '{print $2}' | wc -l) -ne 1 ]]; then
+        	echo -e "\e[32m[ INFORMATION ]\e[0m Restarting SSH agent on `hostname` host. Please wait."
+        	source ~/bin/.run_ssh_agent bamboopass >> ~/bin/system_diagnostic 2>&1 &
+            wait # wait for expect subprocess
+        fi
+
+        obtain_ssh_agent_parameters
+        if [[ -z "${AGENT_WORKING_DIRECTORY}" ]]; then
+        	echo -e "\e[31m[ WARNING ]\e[0m Could not open a connection to SSH authentication agent. Attempt to repair the problem."
+            ps -fu ${BAMBOO_USER} | grep ssh-agent | grep -v grep | awk '{print "%s ", $2}' | xargs kill -9 # kill all remaining agents
+            source ~/bin/.run_ssh_agent bamboopass >> ~/bin/system_diagnostic 2>&1 &
+            wait # wait for expect subprocess
+            obtain_ssh_agent_parameters
+            if [[ -z "${AGENT_WORKING_DIRECTORY}" ]]; then
+            	echo -e "\e[31m[ CRITICAL ERROR ]\e[0m Operation failed (ssh tunnels are broken). Please contact Comarch ITOPS department."
+            else
+            	export SSH_AUTH_SOCK="${AGENT_WORKING_DIRECTORY}"
+            	[[ ${ERROR} -eq 0 ]] && echo -e "\e[32m[ INFORMATION ]\e[0m Operation finished successfully. The event has been reported."
+            fi
+        else
+        	export SSH_AUTH_SOCK="${AGENT_WORKING_DIRECTORY}"
+        fi
+    fi
+}
+
+function set_custom_variables() {
+    # use proxy to send messages to Slack application
+    ([[ `grep ^URL_PROXY ${SERVERS_ARR_FILE} | awk '{print $NF}'` =~ ^http:// ]] && [[ $1 == 'slack_variables' ]]) && \
+    export https_proxy=`grep ^URL_PROXY ${SERVERS_ARR_FILE} | awk '{print $NF}'`
+}
+
+function send_to_slack() {
+    # send notification only for deployment process - variable ${bamboo_resultsUrl} must exists
+    if [[ ${bamboo_resultsUrl} ]]; then
+        set_custom_variables slack_variables
+        AUTH_TOKEN=`grep ^SLACK_CREDENTIALS ${SERVERS_ARR_FILE}| awk '{print $2}'` # Slack webhook (AUTH_TOKEN)
+        POSIX_TIME=`date +%s` # timestamp
+
+        curl -X POST --data '{
+            "channel":"'"#${ENV,,}"'", "username":"Deployment Supervisor",
+            "attachments":[{"fallback":"Deployment process informations", "pretext":"'"Informations about ${VERSION} release deployment on ${ENV} environment"'",
+            "mrkdwn":"true", "color":"'"${COLOUR}"'", "title":"'"${TITLE}"'",
+            "text":"'"${MESSAGE}\nTrigger reason: ${bamboo_ManualBuildTriggerReason_userName:-scheduled}. Agent ID: ${bamboo_agentId}\nID results <${bamboo_resultsUrl}|${bamboo_resultsUrl##*[=/]}> for detailed informations"'",
+            "footer":"Administrator contact: adam.chalat@comarch.com", "footer_icon":"https://platform.slack-edge.com/img/default_application_icon.png", "ts":"'"${POSIX_TIME}"'"}]
+        }' -i ${AUTH_TOKEN}
+        unset https_proxy http_proxy # remove unnecessary variables (collisions with e.g. wget)
+    fi
+}
+
+function check_available_parameters() {
+	if [[ -z $(echo "${JOB_ARR[@]:0}" | grep -w $1) ]]; then
+		echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Incorrect induction of $(basename $0) script. Please see below."
+		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Available parameters [task]: `echo ${JOB_ARR[@]} | sed 's| |, |g'`\n"
+		stop_deployment "Incorrect induction of $(basename $0) script"
+	fi
+}
+
+function check_source() {
+	if [[ ! -d ${VERSION_DIR} ]]; then
+		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Aborting deployment, because of lacking ${VERSION_DIR} source"
+		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Proper task in Atlassian Bamboo should be enabled or version should be downloaded manually from Artifactory repository"
+		stop_deployment "Aborting deployment, because of lacking ${VERSION_DIR} source"
+	fi
+}
+
+function script_help() {
+	if [ $# -lt 2 ]; then
+		echo -e "\nDeployment tool by $(colored "32" "adam.chalat@comarch.com")\n"
+		echo "This script requires below parameters:"
+		echo -e "Available parameter [version]: indication to version which should be installed"
+		echo -e "Available parameter [environment]: `grep ^ENV_LIST ${SERVERS_ARR_FILE}| awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`\n"
+		echo -e "Usage: $(colored "34" "$(basename $0) [version] [environment]")\n"
+		stop_deployment "Incorrect induction of $(basename $0) script"
+	fi
+}
+
+function check_errors() {
+	if [ ${CODE} -ne 0 ]; then
+		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Aboring deployment, because of errors during installation process"
+		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Induction function: $(colored "34" "${FUNCNAME}")"
+		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error line: $(colored "34" "${BASH_LINENO}")"
+		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error code: $(colored "34" "${CODE}")"
+		TITLE="Errors during files validation (corrupted binaries data)"; MESSAGE="Induction function: ${FUNCNAME}\nError line: ${BASH_LINENO}. Error code: ${BASH_LINENO}"; COLOUR='danger'; send_to_slack &>/dev/null
+		exit 1
+	fi
+}
+
+function fLog() {
+    FLOG_CODE=$? # check if last command was successfully executed
+    if [ "${1}" = "-n" ]; then
+    	echo -e "`echo "${@:2}" | grep -v "UNAUTHORIZED USE PROHIBITED."`"
+    else
+    	if [ $FLOG_CODE -eq 0 ]; then
+    		echo -e "`echo "${1}" | grep -v "UNAUTHORIZED USE PROHIBITED."`"
+    	else
+    		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Aboring deployment, because of errors during installation process"
+    		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Notifier script: $(colored "34" "$(basename $0)")"
+    		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Induction function: $(colored "34" "${FUNCNAME}")"
+    		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error line: $(colored "34" "${BASH_LINENO}")"
+    		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error code: $(colored "34" "${FLOG_CODE}")"
+    		TITLE="Errors occured during executing script: $(basename $0)"; MESSAGE="Induction function: ${FUNCNAME}\nError line: ${BASH_LINENO}. Error code: ${FLOG_CODE}"; COLOUR='danger'; send_to_slack &>/dev/null
+    		exit ${FLOG_CODE}
+    	fi
+    fi
+}
+
+function run_remote_command() {
+    [ "${2}" = "-n" ] && shift_positions="3" || shift_positions="2" # check number of arguments to avoid errors catching
+    
+    print_border=$(printf "%-$(((${#1} + ${#USER})*2 + 17))s" "-")
+    echo -e "${print_border// /-}\nServer: $(colored "35" "${1}") | User: $(colored "35" "${USER}")\n${print_border// /-}" # first induction argument: HOST
+    echo -e "Executing command: $(colored "34" "${@:${shift_positions}}")"
+    
+    # switch 'c' - read and execute commands from the first non-option argument command_string, then exit (https://www.gnu.org/software/bash/manual/bashref.html)
+    # switch 'l' - make this shell act as if it had been directly invoked by login
+    ssh -qo BatchMode=yes ${USER}@${1} "bash -l -c '${@:${shift_positions}}'" 2>&1; SSH_CODE=$?
+    if [ ${shift_positions} != "3" ] && [ ${SSH_CODE} -ne 0 ]; then
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Aboring deployment, because of errors during installation process"
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Notifier script: $(colored "34" "$(basename $0)")"
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Induction function: $(colored "34" "${FUNCNAME}")"
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Executed command: $(colored "34" "${@:${shift_positions}}")"
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error line: $(colored "34" "${BASH_LINENO}")"
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error code: $(colored "34" "${SSH_CODE}")"
+    	TITLE="Errors occured during executing script: $(basename $0)"; MESSAGE="Induction function: ${FUNCNAME}\nError line: ${BASH_LINENO}. Error code: ${SSH_CODE}"; COLOUR='danger'; send_to_slack &>/dev/null
+    	exit ${SSH_CODE}
+    fi
+    return ${SSH_CODE} # return value for fLog function (handling errors)
+}
+
+function component_validation() {
+    # softlinks validation - preventing incorrect configuration propagation, when component was deployed manually with different induction switches (copy only when '--silent' was in induction arguments)
+    # first argument: deployment softlink name, second argument: primary softlink, third argument: application type
+    if [[ `grep ^${ENV}_CONFIGURATION ${SERVERS_ARR_FILE} | awk '{print $3}'` == 'HOT_DEPLOY' ]] && [[ $(echo "$@" | grep -w '\-\-silent') ]]; then
+    	awk -v env_name="${ENV}" '$1 == env_name { print }' ${SERVERS_ARR_FILE} | awk '(NF==7)' | grep -w "$3" | while read CHECK_NODE; do
+    		USER=$(awk '{print $5}' <<< ${CHECK_NODE}); HOST=$(awk '{print $3}' <<< ${CHECK_NODE}); RHOME=$(awk '{print $6}' <<< ${CHECK_NODE})
+    		CHECK_CURRENT=$(run_remote_command ${HOST} -n "[[ -L "${RHOME}/$1" ]] && [[ -e "${RHOME}/$1" ]]" < /dev/null)
+    		if [[ $? -ne 0 ]]; then
+    			fLog "$(colored "31" "[ WARNING ]") Missing ${RHOME}/$1 softlink on ${USER}@${HOST} (restoring to prevent incorrect configuration propagation)"
+    			RESULT=$(run_remote_command ${HOST} "cp -P ${RHOME}/$2 ${RHOME}/$1" < /dev/null)
+    		fi
+    	done
+    fi
+}
+
+#--------------------------------------------------------------------#
+#---------------------------- PARAMETERS ----------------------------#
+#--------------------------------------------------------------------#
+
+VERSION="${1}" # deployed release version
+TARGET_VERSION="${1#*to}" # boundary version (deployed limit range A.B.C.DtoZ.X.Y.W) 
+ENV="${2}" # target remote environment
+VARIABLE="${3}" # additional variable
+
+#--------------------------------------------------------------------#
+#---------------------------- READ ARRAY ----------------------------#
+#--------------------------------------------------------------------#
+
+LHOME=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) # get parent directory
+[[ -z $@ ]] && {
+	echo -e "\e[31m[ CRITICAL ERROR ]\e[0m Script requires at least name of target environment to load proper configuration"
+	echo -e "\e[31m[ CRITICAL ERROR ]\e[0m Available environments:" `grep -v '^#' ${LHOME}/projects-configuration 2>/dev/null | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'` 
+	exit 1
+}
+
+for argument in $@; do
+    PROJECT=$(grep -v '^$\|^#' ${LHOME}/projects-configuration | grep -w ${argument} | awk '{print $1}') # search for environment declaration (exclude empty lines and comments)
+    [[ ${PROJECT} ]] && { [[ -f ${LHOME}/${PROJECT}/bin/servers.arr ]] && break || { echo -e "\e[31m[ CRITICAL ERROR ]\e[0m Missing configuration file ${LHOME}/${PROJECT}/bin/servers.arr"; exit 1; } }
+    ([[ ${argument} == ${@: -1} ]] && [[ -z ${PROJECT} ]]) && { echo -e "\e[31m[ CRITICAL ERROR ]\e[0m No matching environment in ${LHOME}/projects-configuration declaration file"; exit 1; }
+done
+
+# search for declared ENV_LIST key and list entries starting only with with definied prefixes and having also only seven columns
+readarray SERVERS_ARRAY <<< "$(for SORT_ENV in `grep ^ENV_LIST ${LHOME}/${PROJECT}/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}' | tr ',' ' '`; do
+	awk "/^${SORT_ENV}/" ${LHOME}/${PROJECT}/bin/servers.arr | awk '(NF==7)'; done)"
+
+#--------------------------------------------------------------------#
+#------------------------------ PATHS -------------------------------#
+#--------------------------------------------------------------------#
+
+BIN_DIR="~/bin" # path to operation scripts on target environment
+BIN_PATH=${LHOME}/deployment-scripts # source scripts location
+BIN_REPO=${LHOME}/../repo-bin # environments configuration, uploaded packages, deployment binaries location
+ARCH_PATH=${LHOME}/../repo-arch # archive packages location
+LOGS_DIR=${LHOME}/${PROJECT}/logs # extract packages, step files and extract packages files location
+TOSERVERS_PATH=${BIN_PATH}/toservers # scripts deployed during installation
+VERSION_DIR=${BIN_REPO}/${ENV}-${VERSION} # direct package location
+CRM_DIR=${VERSION_DIR}/crm # subdirectory of package - CRM components
+SERVER_COMPONENTS=${LHOME}/../server_components # path to server components (Java JDK, ZK, RabbitMQ)
+BAMBOO_BUILD_XML=${LHOME}/../bamboo_server/bamboo-home/xml-data/builds # bamboo builds data
+
+#--------------------------------------------------------------------#
+#---------------------------- VARIABLES -----------------------------#
+#--------------------------------------------------------------------#
+
+SERVERS_ARR_FILE=${LHOME}/${PROJECT}/bin/servers.arr # configuration file
+STEPS_FILE=${LOGS_DIR}/step_files/${2}/deployment_${1}.stp # deployment logfile
+SECONDS=0 # count the amount of time during task execution
+TIME_STAMP="date +\"[\"%F\"]\"\"[\"%R\":\"%S\"]\"" # required by common_after script
+SYSTEM_VERSION=$(grep ^'SYSTEM_VERSION' ${SERVERS_ARR_FILE} | awk '{print $2}') # environment release: 7.0, 7.1, 7.2, 7.3
+
+#--------------------------------------------------------------------#
+#-------------------------- PREREQUSITIES ---------------------------#
+#--------------------------------------------------------------------#
+
+load_keys_and_variables # load required SSH parameters protected by passphrase
+
+# create required folders (key ENV_LIST must exists in servers.arr)
+mkdir -p ${SERVER_COMPONENTS}/Scripts
+awk '$1 == "ENV_LIST" { print }' ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}{print out}}' | tr ',' '\n' | while read ENV_FOLDER; do
+	mkdir -p ${LOGS_DIR}/{step_files,semaphore}/${ENV_FOLDER}; done
+
+find ${LOGS_DIR}/step_files/ -size 0 -print0 | xargs -0 rm -f # remove empty files from logs directory
+[[ ! -f ${STEPS_FILE} && $(basename $0) != "extractpackage" && ${STEP_NAME} ]] && touch ${STEPS_FILE} # create required .stp file during deployment
+
+#--------------------------------------------------------------------#
+#--------------------- CHECK DEPLOYMENT LOGFILE ---------------------#
+#--------------------------------------------------------------------#
+
+# execute package download every time and avoid checking if STEP_NAME does not exist
+if [ -z "${EXTRACTPACKAGE}" ] && [ ${STEP_NAME} ]; then
+	if [[ `grep -P "^(?=.*${STEP_NAME})(?=.*skipping)" ${STEPS_FILE}` ]]; then
+		echo -e "$(colored "31" "[ WARNING ]") Skipping $(colored "34" "${STEP_NAME^^}") task, because of lacking binaries in repository"
+        echo -e "$(colored "31" "[ WARNING ]") Artifacts should be veryfied for the accuracy and the timeliness of stored data"
+		exit 0
+	elif [[ `grep ${STEP_NAME} ${STEPS_FILE}` ]]; then
+		echo -e "$(colored "32" "[ INFORMATION ]") Task $(colored "34" "${STEP_NAME^^}") has been already successfully executed"
+		echo -e "$(colored "32" "[ INFORMATION ]") Detailed informations: `grep ${STEP_NAME} ${STEPS_FILE}`"
+		exit 0
+	fi
+fi

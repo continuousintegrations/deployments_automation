@@ -1,0 +1,212 @@
+#!/bin/bash -
+# build_date=24.07.2017
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="Checking_upgrade_possibility"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep CRM | head -n1 | awk '{ print $6 }'`
+
+#--------------------------------------------------------------------#
+#-------------------------- FUNCTIONS -------------------------------#
+#--------------------------------------------------------------------#
+
+function check_upgrade() {
+    # get the highest version in branch x.x.X or x.x.x.X if definied argument
+    function CURL_CHECK() { curl -siu ${USER_ART}:${PASSWORD_ART} "http://${REPO_PATH}/${REPOSITORY}/${1}/" | grep "<a href=\".*</a>.*-" | sed 's|.*="||g' | sed 's|/".*||g' | sort -V | tail -n1; }
+    
+    RESULT=$(run_remote_command ${SERV[2]} "[ -f ${RHOME}/servers/presentation/d10000conf_presentation/conf/build.ver ]")
+    if [ $? -ne 0 ]; then
+    	fLog "$(colored "31" "[ CRITICAL ERROR ]") File build.ver does not exist in path: ${RHOME}/servers/presentation/d10000conf_presentation/conf on ${SERV[2]} host"
+    	stop_deployment "File build.ver does not exist in destination path"
+    fi
+
+    REPOSITORY=`grep ^ARTIFACTORY_${ENV} ${SERVERS_ARR_FILE} | awk '{print $3}'`
+    USER_ART=`grep ^ART_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $2}'`
+    PASSWORD_ART=`grep ^ART_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $3}'`
+    REPO_PATH=`grep ^ART_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $4}'`
+
+    CUMULATIVE_VERSION=${VERSION} # store induction version for future needs
+    VERSION=${VERSION%to*} # generate the name of version based on suffix of cumulative version (starting version is checked)   
+    HASH_VERSION=$(curl -siu ${USER_ART}:${PASSWORD_ART} "http://${REPO_PATH}/${REPOSITORY}/${VERSION%.*}/${VERSION}/" | \
+    grep -v 'sha1\|md5' | grep -P "(?=.*bss-backend)(?=<a href=\".*</a>.*-)" | sed -e 's|.*="||g' -e 's|">.*||g' | awk -F"-" '{printf "%s-" $(NF),$(NF-1)}') # hash number of installed version
+    LOG_PATH="${LOGS_DIR}/step_files/${ENV}" # path to the latest deployment .stp logs (according to version installed on environment)
+    VERSION_ART=$(CURL_CHECK `CURL_CHECK`) # latest version in local repository
+    HASH_REPO=$(curl -siu ${USER_ART}:${PASSWORD_ART} "http://${REPO_PATH}/${REPOSITORY}/${VERSION_ART%.*}/${VERSION_ART}/" | grep "<a href=\".*-bss-backend.*.zip</a>" | sed 's|</a>.*||g' | awk -F"-" '{printf "%s-" $(NF),$(NF-1)}')
+
+    # system version based on informations contained in the 'build.ver' file
+    CHECK_BUILD_VER=`run_remote_command ${SERV[2]} "grep ${ENV} ${RHOME}/servers/presentation/d10000conf_presentation/conf/build.ver | wc -w" | tail -n1`
+    SYSTEM_VERSION=`run_remote_command ${SERV[2]} -n "grep ${ENV} ${RHOME}/servers/presentation/d10000conf_presentation/conf/build.ver" | tail -n1 | awk '{print $NF}' | sed 's|version-||g' | sed 's|-.*||g'`
+    HASH_INSTALLED=`run_remote_command ${SERV[2]} -n "grep ${ENV} ${RHOME}/servers/presentation/d10000conf_presentation/conf/build.ver" | tail -n1 | awk '{print $NF}' | sed 's|version-||g' | awk -F"-" '{printf "%s-" $(NF),$(NF-1)}'`
+    if [[ ${CHECK_BUILD_VER} -ne 5 ]] || [[ `echo ${SYSTEM_VERSION} | awk -F. '{print NF}'` -ne 4 ]]; then
+    	fLog "$(colored "31" "[ CRITICAL ERROR ]") File ${RHOME}/servers/presentation/d10000conf_presentation/conf/build.ver on ${USER}@${HOST} host is corrupted"
+    	fLog "$(colored "31" "[ CRITICAL ERROR ]") File should have 5 columns and last started with version should contain harcoded pattern: X.Y.Z.W which is mendatory"
+    	fLog "$(colored "31" "[ CRITICAL ERROR ]") Required structure: '\${Environment name}' '\${version}' '\${hostname}' CRM version-X.Y.Z.W-\${prefix}"
+    	stop_deployment "File build.ver on ${USER}@${HOST} host is corrupted"
+    fi
+
+    # check if version exists in artifactory repository (argument ${VERSION} must be changed in next part of script - package is build on the basis of second part of xtoY value)
+    for VERSION_NAME in ${TARGET_VERSION} ${VERSION}; do
+    	if ! [[ $(wget -S --spider --user=${USER_ART} --password=${PASSWORD_ART} "http://${REPO_PATH}/${REPOSITORY}/${VERSION_NAME%.*}/${VERSION_NAME}" 2>&1 | grep 'HTTP/1.1 200 OK') ]]; then
+    		fLog "$(colored "31" "[ CRITICAL ERROR ]") Version ${VERSION_NAME} does not exist in ${REPOSITORY} repository."
+    		fLog "$(colored "31" "[ CRITICAL ERROR ]") Accuracy of given deployment arguments should be veryfied - please check remote repository."
+    		stop_deployment "Version ${VERSION_NAME} does not exist in ${REPOSITORY} repository"
+    	fi
+    done
+
+    fLog "$(colored "34" "[ INFORMATION ]") Checking possibility of ${ENV} environment upgrade"
+    fLog "Version chosen for deployment: $(colored "35" "${TARGET_VERSION}-${HASH_VERSION%.zip}")"
+    fLog "Installed system version: $(colored "32" "${SYSTEM_VERSION}-${HASH_INSTALLED}")"
+    fLog "Latest version in local repository: $(colored "34" "${VERSION_ART}-${HASH_REPO%.zip}")"
+
+    # check only for cumulative version
+    if [[ ${VERSION} != ${TARGET_VERSION} ]]; then
+        # check the cumulative version - compare range (initial and end value)
+        if [[ `echo ${VERSION} | tr '.' ' ' | awk '{print $(NF-2)}'` -gt `echo ${TARGET_VERSION} | tr '.' ' ' | awk '{print $(NF-2)}'` ]] || 
+        	[[ `echo ${VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` -gt `echo ${TARGET_VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` ]] ||
+        	([[ `echo ${VERSION} | tr '.' ' ' | awk '{print $NF}'` -gt `echo ${TARGET_VERSION} | tr '.' ' ' | awk '{print $NF}'` ]] && \
+        		[[ `echo ${VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` -eq `echo ${TARGET_VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` ]]); then
+        	fLog "$(colored "31" "[ CRITICAL ERROR ]") Initial version number: ${VERSION} and the final: ${TARGET_VERSION} are incorrect. Summary range should be corrected."
+        	stop_deployment "Initial version number: ${VERSION} and the final: ${TARGET_VERSION} are incorrect. Summary range should be corrected."
+        fi
+
+        # check the initial value of cumulative version and compare with currently installed on environment
+        if [[ `echo ${TARGET_VERSION} | tr '.' ' ' | awk '{print $(NF-2)}'` -lt `echo ${SYSTEM_VERSION} | tr '.' ' ' | awk '{print $(NF-2)}'` ]] || 
+        	[[ `echo ${TARGET_VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` -lt `echo ${SYSTEM_VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` ]] ||
+        	([[ `echo ${TARGET_VERSION} | tr '.' ' ' | awk '{print $NF}'` -lt `echo ${SYSTEM_VERSION} | tr '.' ' ' | awk '{print $NF}'` ]] && \
+        		[[ `echo ${TARGET_VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` -eq `echo ${SYSTEM_VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` ]]); then
+        	fLog "$(colored "31" "[ CRITICAL ERROR ]") Initial version number: ${TARGET_VERSION} is lower than currenly installed on environment: ${SYSTEM_VERSION}"
+        	stop_deployment "Initial version number: ${TARGET_VERSION} is lower than currenly installed on environment: ${SYSTEM_VERSION}"
+        fi
+    fi
+
+    # check the release correctness
+    if [[ `echo ${VERSION} | cut -d'.' -f1-2` != `echo ${SYSTEM_VERSION} | cut -d'.' -f1-2` ]]; then
+    	fLog "$(colored "31" "[ CRITICAL ERROR ]") This version cannot be installed on ${ENV} environment."
+    	fLog "$(colored "31" "[ CRITICAL ERROR ]") You are trying to install release `echo ${VERSION} | cut -d'.' -f1-2`. Current release is `echo ${SYSTEM_VERSION} | cut -d'.' -f1-2`."
+    	stop_deployment "You are trying to install release `echo ${VERSION} | cut -d'.' -f1-2`. Current release is `echo ${SYSTEM_VERSION} | cut -d'.' -f1-2`"
+    fi
+
+    # check if specified package was installed on environemnt and downagrade attempt was performed for environemnt
+    # into consideration is taken also hash number of version (bss-backend component) 
+    if [[ "${SYSTEM_VERSION}" == "${TARGET_VERSION}" ]] && [[ "${HASH_VERSION%.zip}" == "${HASH_INSTALLED}" ]]; then
+    	fLog "$(colored "31" "[ CRITICAL ERROR ]") Version ${TARGET_VERSION} is already installed on ${ENV} environemnt. Aborting deployment process."
+    	stop_deployment "Version ${TARGET_VERSION} is already installed on ${ENV} environemnt"
+    elif [[ `echo ${SYSTEM_VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` -gt `echo ${TARGET_VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` ]]; then # check last but one digit in version number
+    	fLog "$(colored "31" "[ CRITICAL ERROR ]") You are trying to downgrade system. Current branch: ${SYSTEM_VERSION%.*}. Selected branch: ${TARGET_VERSION%.*}."
+    	stop_deployment "You are trying to downgrade system. Current branch: ${SYSTEM_VERSION%.*}. Selected branch: ${TARGET_VERSION%.*}"
+	elif [[ `echo ${SYSTEM_VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` -eq `echo ${TARGET_VERSION} | tr '.' ' ' | awk '{print $(NF-1)}'` ]]; then # check if last but one digit in version number is greater than current system digit
+		if [[ $((`echo ${TARGET_VERSION} | tr '.' ' ' | awk '{print $NF}'` - 1)) -lt `echo ${SYSTEM_VERSION} | tr '.' ' ' | awk '{print $NF}'` ]]; then # check last digit in version number
+			if [[ "${HASH_VERSION%.zip}" == "${HASH_INSTALLED}" ]]; then
+				fLog "$(colored "31" "[ CRITICAL ERROR ]") You are trying to downgrade system. Current version: ${SYSTEM_VERSION}. Selected version: ${TARGET_VERSION}."
+				stop_deployment "You are trying to downgrade system. Current version: ${SYSTEM_VERSION}. Selected version: ${TARGET_VERSION}"
+			fi
+		fi
+	fi
+
+	# check if currently installed version belongs to the same branch as already deployed on server
+	if [[ ${SYSTEM_VERSION} == ${TARGET_VERSION} ]] && [[ $HASH_INSTALLED != ${HASH_VERSION%.zip} ]]; then
+		fLog "$(colored "31" "[ WARNING ]") Deployed version belongs to the same ${TARGET_VERSION} branch as already installed on server"
+		fLog "$(colored "31" "[ WARNING ]") Skipping verificatio of the deployment step file for the currently installed $HASH_INSTALLED version"
+	else
+    	# check if installation of liquibases for current version of system was performed successfully
+    	# search for newest .stp log file (for both cases: cumulative and single release upgrade) - exclude currently deployed version
+    	SYSTEM_LOGFILE=$(find ${LOG_PATH} -type f ! -name "deployment_${CUMULATIVE_VERSION}.stp" -name "deployment_*${SYSTEM_VERSION}*.stp" 2>/dev/null -exec ls -t {} + | head -n1)
+    	if [[ "${SYSTEM_LOGFILE}" ]]; then
+        	if ! grep -q 'CRM_liquibase_changeset' ${SYSTEM_LOGFILE} || ! grep -q 'BS_liquibase_changeset' ${SYSTEM_LOGFILE}; then # check correctness of liquibase installation (general case - stp entries)
+        		fLog "$(colored "31" "[ CRITICAL ERROR ]") Completion of steps: BS_liquibase_changeset and CRM_liquibase_changeset has to be checked in `basename ${SYSTEM_LOGFILE}` file."
+        		fLog "$(colored "31" "[ CRITICAL ERROR ]") There are missing execution task confirmations for deployed ${SYSTEM_VERSION} version."
+        		stop_deployment "Completion of steps: BS_liquibase_changeset and CRM_liquibase_changeset has to be checked in `basename ${SYSTEM_LOGFILE}` file"
+        	fi
+        else
+        	fLog "$(colored "31" "[ CRITICAL ERROR ]") There is no deployment_${SYSTEM_VERSION}.stp file in logs directory for currently installed version on ${ENV} environment."
+        	fLog "$(colored "31" "[ CRITICAL ERROR ]") Directory ${LOG_PATH} has to be checked for missing file."
+        	stop_deployment "There is no deployment_${SYSTEM_VERSION}.stp file in logs directory for currently installed version on ${ENV} environment"
+        fi
+    fi
+
+    function verify_liquibase_execution() {
+    	if [[ `grep ^FEATURE_BRANCH ${SERVERS_ARR_FILE} | awk '{print $2}'` == 'TRUE' ]]; then
+    		while read FILE; do
+    			if grep -q CRM_liquibase_changeset $FILE; then
+    				fLog "$(colored "33" "[ ${RELEASE_NAME} release ]") Liquibase belonging to ${RELEASE_NAME%.*} branch was already installed on ${ENV} environment"
+    				fLog "$(colored "33" "[ ${RELEASE_NAME} release ]") Confirmation was found in $FILE"
+    				fLog "$(colored "33" "[ ${RELEASE_NAME} release ]") Removing deployment lockfile: lock_deployment_${RELEASE_NAME%.*}"
+    				rm -f ${LOGS_DIR}/semaphore/${ENV}/lock_deployment_${RELEASE_NAME%.*}
+    				break
+    			fi
+    		done < <(grep -l Liquibase-${RELEASE_NAME%.*} ${LOG_PATH}/deployment_*${RELEASE_NAME%.*}*.stp)
+    	else
+    		fLog "$(colored "31" "[ WARNING ]") Project does not support feature branch and requires installation of boundary liquibase for each branch"
+    	fi
+    }
+
+    # check if all database liquibases are installed (iterate from currently chosen version, reduced by one, to the bottom of repository)
+    curl -siu ${USER_ART}:${PASSWORD_ART} "http://${REPO_PATH}/${REPOSITORY}/" | grep "<a href=\".*</a>.*-" | sed 's|.*="||g' | sed 's|/".*||g' | sort -V | sed "/${VERSION%.*}/q" | sed "/${VERSION%.*}/d" |
+    while read BRANCH_NAME; do
+    	# reverse releases within branch to check only the last shared package
+    	curl -siu ${USER_ART}:${PASSWORD_ART} "http://${REPO_PATH}/${REPOSITORY}/${BRANCH_NAME}/" | grep "<a href=\".*</a>.*-" | sed 's|.*="||g' | sed 's|/".*||g' | sort -r | sed "/${VERSION}/q" | sed "/${VERSION}/d" |
+    	while read RELEASE_NAME; do
+    		for COMPONENT in bss-db Liquibase; do
+    			liquibase=`curl -siu ${USER_ART}:${PASSWORD_ART} "http://${REPO_PATH}/${REPOSITORY}/${BRANCH_NAME}/${RELEASE_NAME}/" | grep ${COMPONENT} | grep -v 'sha1\|md5' | sort -rV | head -n1 | sed 's|.*="||g' | sed 's|">.*||g'`
+    			if [[ ${liquibase} ]] && [[ ! `grep ${liquibase} ${LOG_PATH}/deployment_*.stp` ]]; then
+    				fLog "$(colored "31" "[ ${RELEASE_NAME} release ]") Required database liquibase, ${liquibase}, was not installed"
+                    echo lock_deployment_${RELEASE_NAME%.*} > ${LOGS_DIR}/semaphore/${ENV}/lock_deployment_${RELEASE_NAME%.*} # the shell waits for all commands in the pipeline to terminate, so cannot break out piped while read
+                    verify_liquibase_execution
+                elif [[ `grep ${liquibase} ${LOG_PATH}/deployment_*.stp` ]]; then
+                	while read TASK_CONFIRMATION; do
+                		VALIDATION='FALSE'
+                		[[ ${COMPONENT} == 'bss-db' ]] && TASK_NAME='BS_liquibase_changeset' || TASK_NAME='CRM_liquibase_changeset'
+                		grep -q ${TASK_NAME} ${TASK_CONFIRMATION} && VALIDATION='TRUE' && break
+                	done < <(grep -l ${liquibase} ${LOG_PATH}/deployment_*.stp)
+                	[[ ${VALIDATION} != 'TRUE' ]] && {
+                		fLog "$(colored "31" "[ ${RELEASE_NAME} release ]") ${TASK_NAME%%_*} database liquibase: ${liquibase,,}, was not deployed successfully during last deployment"
+                		echo lock_deployment_${RELEASE_NAME%.*} > ${LOGS_DIR}/semaphore/${ENV}/lock_deployment_${RELEASE_NAME%.*}
+                		verify_liquibase_execution
+                	}
+                fi
+            done
+            [[ `grep ^SKIP_LIQUIBASES ${SERVERS_ARR_FILE} | grep ${ENV}` && ${COMPONENT} == 'Liquibase' ]] && break # prevent checking versions older than newest in branch (situation for incremental packages)
+        done
+    done
+
+    if ls ${LOGS_DIR}/semaphore/${ENV}/lock_deployment_* 1>/dev/null 2>&1; then
+    	fLog "$(colored "31" "[ CRITICAL ERROR ]") Lacking database liquibases have to be installed to unlock deployment of ${CUMULATIVE_VERSION} version."
+    	fLog "$(colored "31" "[ CRITICAL ERROR ]") Definied version scope should be expanded in deployment induction"
+    	rm -r ${LOGS_DIR}/semaphore/${ENV}/lock_deployment_*
+    	stop_deployment "Lacking database liquibases have to be installed to unlock deployment of ${CUMULATIVE_VERSION}."
+    fi
+    fLog "$(colored "32" "[ INFORMATION ]") Validation successfully completed. Software versions are compatible."
+}
+
+#--------------------------------------------------------------------#
+#------------------------ FUNCTION CALL -----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+	SERV=($SERVER)
+	if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "CRM" && "${SERV[3]}" = "1" ]]; then
+		HOST="${SERV[2]}"; USER="${SERV[4]}"
+		check_upgrade
+		break
+	fi
+done
+
+# avoid writing stepname to .stp file during build and avoid terminating deployment after updating version string in build.xml
+[[ -z ${bamboo_plan_storageTag} ]] && source ${BIN_PATH}/common_after || :

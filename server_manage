@@ -1,0 +1,220 @@
+#!/bin/bash -
+# server manage tool by adam.chalat@comarch.com
+# to add pacemaker to deployemnt there should be added proper entry in servers.arr (HA_RELEASE) (see also proper functions: manage_service, status_service)
+# into consideration are taken only main nodes (removing main node will stop task execution, also TYPE is important - after break is searched first occurrence, servers.arr order list is crucial)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="04.07.2017r."
+SCRIPT_VERSION="0.2.33"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nServer manage tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [component]: all, AIF, BSS, BPC, CRM, DPS, ES (ElasticSearch), JR (JackRabbit), RMQ (RabbitMQ), TUM, ZK (ZooKeeper)"
+	echo "Available parameter [task]: start, restart, stop, status"
+	echo "Available parameter [environment]: `grep ^ENV_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	echo -e "Available parameter [switch]: --noerror (optional - avoid errors during status check)\n"
+	echo -e "Usage: $(colored "34" "server_manage [component] [task] [environment] [switch]")\n"
+	stop_deployment "Incorrect induction of $(basename $0) script"
+fi
+
+#--------------------------------------------------------------------#
+#--------------------- PARAMETERS AND VARIABLES ---------------------#
+#--------------------------------------------------------------------#
+
+COMPONENT=${1,,}
+TASK=${2,,}
+ENV=${3^^}
+RELEASE=$4 # used during deployment to check .stp file (task verification)
+GENERATE_FILE=$5 # used during deployment (generate file in semaphore folder to take actions in future parallel tasks)
+
+PARENT_PID=$$
+STEP_NAME="${COMPONENT^^}_application_${TASK}"
+SECONDS=0
+
+[[ ${COMPONENT} == 'all' ]] && list="crm bss es rmq tum bpc aif dps jr zk" || list=${COMPONENT} # create matrix for loop
+CRM="jr jackrabbit crm zk zookeeper"; CPM="es elasticsearch rmq bss rmq rabbitmq"; DPS="dps"; TUM="tum"; BPC="bpc"; AIF="aif" # generate list to detect proper environment type
+
+#--------------------------------------------------------------------#
+#------------------------- CHECK PARAMETERS -------------------------#
+#--------------------------------------------------------------------#
+
+declare -a COMPONENT_ARR=("all" "aif" "bss" "bpc" "crm" "dps" "es" "jr" "rmq" "tum" "zk")
+declare -a TASK_ARR=("start" "stop" "restart" "status")
+
+if [[ -z $(echo "${COMPONENT_ARR[@]:0}" | grep -w ${COMPONENT}) ]]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong component parameter. Please see below"
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Available parameters [component]: all, AIF, BSS, BPC, CRM, DPS, ES (ElasticSearch), JR (JackRabbit), RMQ (RabbitMQ), TUM, ZK (ZooKeeper)\n"
+	exit 1
+elif [[ -z $(echo "${TASK_ARR[@]:0}" | grep -w ${TASK}) ]]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong task parameter. Please see below."
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Available parameters [task]: start, stop, restart, status\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------------ PATHS -------------------------------#
+#--------------------------------------------------------------------#
+
+STEPS_FILE=${LOGS_DIR}/step_files/${3}/deployment_${4}.stp # overwrite default variable (variable declaration difference)
+SEMAPHORE=${LOGS_DIR}/semaphore
+
+#--------------------------------------------------------------------#
+#---------------------------- FUNCTIONS -----------------------------#
+#--------------------------------------------------------------------#
+
+function copy_location_finder() {
+	run_remote_command ${SERV[2]} "find ~ -maxdepth 1 -type f -name \"bin\" -exec rm -f {} +" # remove casuing errors regular files
+	run_remote_command ${SERV[2]} "mkdir -p ~/bin" # create required directories
+
+	echo "Copying: location finder tool, servers array, mubemanage and management scripts"
+	echo "Destination directory: ${BIN_DIR}"
+	RESULT=$(scp -pq ${TOSERVERS_PATH}/location_finder ${SERVERS_ARR_FILE} ${BIN_PATH}/toservers/mubemanage ${TOSERVERS_PATH}/$1 ${USER}@${SERV[2]}:${BIN_DIR} 2>&1)
+	CODE=$?; check_errors 3>&1 1>&2 2>&3 # reverse STDOUT and STDERR
+	run_remote_command ${SERV[2]} "find ${BIN_DIR} -type f -print | xargs chmod 764" &>/dev/null
+	echo "Location finder tool, servers array, mubemanage and management scripts copied successfully"
+}
+
+function remove_decrpted_files() {
+	echo -e "\n$(colored "34" "[ INFORMATION ]") Performing post execution tasks. Please wait."
+	rm -f ${LOGS_DIR}/semaphore/${ENV}/server_manage_${PARENT_PID}.pid
+
+	# remove decrypted files only when no remaining semaphore files exists in logs directory
+	if [[ `grep ^PROTECTED_ENVIRONMENTS ${SERVERS_ARR_FILE} | grep ${ENV}` ]] && [[ -z `find ${LOGS_DIR}/semaphore/${ENV} -name "server*.pid"` ]]; then
+		for SERVER in "${SERVERS_ARRAY[@]}"; do
+			SERV=($SERVER)
+			if [[ "${SERV[0]}" == "${ENV^^}" ]]; then
+				HOST="${SERV[2]}"; USER="${SERV[4]}"
+				ssh -qo BatchMode=yes ${USER}@${HOST} "bash -l -c 'find ~/bin -maxdepth 1 -type f -name \"*_manage\" -exec rm {} \;'" &>/dev/null # remove decrypted files from all nodes
+			fi
+		done
+	fi
+}
+
+#--------------------------------------------------------------------#
+# SERVICE ADMINISTRATION (BSS, BPC, CRM, DPS, ES, JR, RMQ, TUM, AIF) #
+#--------------------------------------------------------------------#
+
+function manage_component() {
+	echo $$ > ${SEMAPHORE}/${ENV}/${1,,}_${TASK}.pid
+
+	echo -e "\n$(colored "34" "[ INFORMATION ]") Updating required configuration and management scripts. Please wait."
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		TEMP_SERV=($SERVER)
+		([[ "${TEMP_SERV[0]}" == "${ENV^^}" ]] && [[ "${TYPE}" == "${TEMP_SERV[1]}" ]]) && copy_location_finder $2 1>/dev/null # output only errors during SCP
+	done
+
+	if [[ "${TASK}" =~ ^(stop|start|restart)$ ]]; then
+		echo -e "\n`printf '=%.0s' {1..55}`\n$(colored "35" "EXECUTING ${TASK^^} TASK FOR ${APPLICATION^^} APPLICATION")\n`printf '=%.0s' {1..55}`"
+		run_remote_command ${SERV[2]} "${APPLICATION,,}_manage all ${TASK} ${ENV}"
+	elif [[ "${TASK}" == 'status' ]]; then
+		echo -e "\n`printf '=%.0s' {1..55}`\n$(colored "35" "CHECKING STATUS OF ${1^^} COMPONENTS")\n`printf '=%.0s' {1..55}`"
+		run_remote_command ${SERV[2]} "$2 all status ${ENV} ${IGNORE_ERRORS+--noerror}"
+	fi
+
+	rm -f ${SEMAPHORE}/${ENV}/${1,,}_${TASK}.pid # remove semaphore file (task has to be performed successfully)
+}
+
+#--------------------------------------------------------------------#
+#----------------------- ZK ADMINISTRATION --------------------------#
+#--------------------------------------------------------------------#
+
+function manage_zk() {
+	[ "${TASK}" = 'status' ] && \
+	{ echo -e "\n`printf '=%.0s' {1..55}`\n$(colored "35" "CHECKING STATUS OF ZOOKEEPER")\n`printf '=%.0s' {1..55}`"; } || { echo -e "$(colored "35" "EXECUTING ${TASK^^} TASK FOR ZOOKEEPER COMPONENTS")"; }	
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		if [[ "${SERV[1]}" =~ ^(CRM|CPM|BPC|TUM|AIF)$ ]] && [[ "${SERV[0]}" = "${ENV}" ]]; then
+			HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+			echo -e "\n$(colored "34" "[ INFORMATION ]") Updating required configuration and management scripts. Please wait."
+			copy_location_finder zk_manage >/dev/null
+
+			run_remote_command ${HOST} "zk_manage all ${TASK} ${ENV} ${IGNORE_ERRORS+--noerror}" # if additional switch '--noerror' is given as argument, then variable $1 is not empty
+			sleep 10 # wait to prevent removing files before executing on remote nodes
+			[[ `grep ^PROTECTED_ENVIRONMENTS ${SERVERS_ARR_FILE} | grep ${VERSION}` ]] && run_remote_command ${SERV[2]} "rm -f -- ~/bin/zk_manage" &>/dev/null # remove decrypted management file
+		fi
+	done
+}
+
+#--------------------------------------------------------------------#
+#------------------------- PREREQUISITIES ---------------------------#
+#--------------------------------------------------------------------#
+
+# specific script induction exclusion (applications can be stop in parallel)
+([[ ${COMPONENT} == 'all' ]] && [[ ${TASK} == 'start' ]]) && { echo -e "$(colored "31" "[ WARNING ]") Parallel start of applications is prohibited (correct order is required)"; exit 0; }
+
+# used for generating files according to bamboo selected tasks - to know, which tasks run in background
+if [[ $GENERATE_FILE = 'check' ]]; then
+	([[ ${RELEASE} ]] && [[ "`cat ${STEPS_FILE} | grep ${STEP_NAME}`" ]]) && \
+	{ echo -e "Task $(colored "34" "${STEP_NAME}") was already successfully executed"; echo -e "Detailed informations: `grep ${STEP_NAME} ${STEPS_FILE}`"; } || \
+	touch ${SEMAPHORE}/${3}/${COMPONENT,,}_${TASK}.pid
+	exit 0
+fi
+
+# check execution of management task for proper release
+if [[ ${TASK} =~ ^(stop|start)$ ]] && [[ ${RELEASE} ]] && [[ "`grep ${STEP_NAME} ${STEPS_FILE}`" ]]; then
+	echo -e "$(colored "32" "[ INFORMATION ]") Task $(colored "34" "${STEP_NAME}") was already successfully executed"
+	echo -e "$(colored "32" "[ INFORMATION ]") Detailed informations: `grep ${STEP_NAME} ${STEPS_FILE}`"
+	exit 0
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+trap 'remove_decrpted_files' EXIT SIGINT SIGTERM SIGKILL
+touch ${LOGS_DIR}/semaphore/${3^^}/server_manage_${PARENT_PID}.pid
+
+for APPLICATION in ${list}; do
+	for COMPONENT_CHECK in CRM CPM DPS TUM BPC AIF; do
+		eval VARIABLE='$'${COMPONENT_CHECK}
+		[[ $VARIABLE =~ (^|[[:space:]])${APPLICATION}($|[[:space:]]) ]] && TYPE=${COMPONENT_CHECK} && break # stop searching if match is found
+	done
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		if [[ "${SERV[0]}" = "${ENV}" ]] && [[ "${SERV[3]}" = "1" ]]; then
+			HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+			if [[ "${TYPE}" == "${SERV[1]}" ]]; then
+				# substitute word, when parameter is set (substitute null when parameter unset) -> ${parameter+word}
+				[[ "${@: -1}" == '--noerror' ]] && IGNORE_ERRORS=''
+
+				[[ ${APPLICATION,,} =~ ^(zk|zookeeper)$ ]] && { manage_zk; continue; }
+				manage_component ${APPLICATION} ${APPLICATION,,}_manage
+
+				break # stop loop after first match
+			fi
+		fi
+	done
+done
+
+#--------------------------------------------------------------------#
+#------------------------- POST EXECUTE -----------------------------#
+#--------------------------------------------------------------------#
+
+# checking if STEP_NAME should be written to stp file
+if [ ${RELEASE} ] && [ ${STEP_NAME} ]; then
+	source ${BIN_PATH}/common_after
+fi

@@ -1,0 +1,87 @@
+#!/bin/bash -
+# build_date=04.07.2017
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="JACKRABBIT_copyextract"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep CRM | head -n1 | awk '{ print $6 }'`
+
+# check if environment supports clustering JR
+[[ `grep ^HA_RELEASE ${SERVERS_ARR_FILE} | grep "${ENV}"` ]] && \
+{ echo -e "$(colored "32" "[ INFORMATION ]") Environment supports JackRabbit clustering"; CLUSTERING=TRUE; } || { echo -e "$(colored "31" "[ WARNING ]") Environment does not support JackRabbit clustering"; CLUSTERING=FALSE; }
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+SERVERS_DIR=${RHOME}/servers
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function copy_to_server() {
+    fLog "$(colored "34" "[ INFORMATION ]") Copying JackRabbit binaries"
+    fLog "Destination directory: ${SERVERS_DIR}"
+    rsync -vrltD --stats --human-readable -e ssh ${CRM_DIR}/image_store.tar.gz ${USER}@${HOST}:${SERVERS_DIR} # used rsync instead of scp, beacuase of partial output and better handling for large files
+    CODE=$?; check_errors
+    fLog "$(colored "32" "[ INFORMATION ]") JackRabbit binaries copied successfully"
+}
+
+function upgrade_jackrabbit() {
+    fLog "$(colored "34" "[ INFORMATION ]") JackRabbit upgrade"
+    run_remote_command ${SERV[2]} "rm -rf ${SERVERS_DIR}/old_image_store/" # remove previous backup
+
+    RESULT=$(run_remote_command ${SERV[2]} -n "[[ -d ${SERVERS_DIR}/image_store ]]")
+    [[ $? -eq 0 ]] && {
+        fLog "Backup of the current data to ${SERVERS_DIR}/old_image_store directory"
+        run_remote_command ${SERV[2]} "mv ${SERVERS_DIR}/image_store/ ${SERVERS_DIR}/old_image_store/"
+    } || fLog "$(colored "31" "[ WARNING ]") Skipping backup process - empty ${SERVERS_DIR}/image_store directory"
+
+    fLog "Extracting new binaries to ${SERVERS_DIR}/image_store directory"
+    run_remote_command ${SERV[2]} "tar -xzf ${SERVERS_DIR}/image_store.tar.gz -C ${SERVERS_DIR}"
+
+    RESULT=$(run_remote_command ${SERV[2]} -n "[[ -d ${SERVERS_DIR}/old_image_store/jackrabbit/ ]]")
+    [[ $? -eq 0 ]] && {
+        fLog "Restoring workspace and repository directories"
+        run_remote_command ${SERV[2]} "cp -pr ${SERVERS_DIR}/old_image_store/jackrabbit/{workspaces/,repository/} ${SERVERS_DIR}/image_store/jackrabbit/"
+    } || fLog "$(colored "31" "[ WARNING ]") There is nothing to restore from previously deployed version"
+
+    fLog "$(colored "32" "[ INFORMATION ]") JackRabbit upgraded successfully"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+    SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "CRM" ]]; then
+        HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+        if [[ "${SERV[3]}" = "1" ]] || ([[ "${SERV[3]}" != "1" ]] && [[ ${CLUSTERING} == 'TRUE' ]]); then
+            copy_to_server
+            upgrade_jackrabbit
+        fi
+    fi
+done
+
+source ${BIN_PATH}/common_after

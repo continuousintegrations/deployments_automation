@@ -1,0 +1,109 @@
+#!/bin/bash -
+# BS/PI and IMPL database importer tool by adam.chalat@comarch.com
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="04.07.2017r."
+SCRIPT_VERSION="0.2.3"
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+    echo -e "\nBS/PI TDP and IMPL database importer tool by \e[32madam.chalat@comarch.com\e[0m"
+    echo -e "Version: \e[35m${SCRIPT_VERSION}\e[0m | Last modification: \e[35m${BUILD_DATE}\e[0m\n"
+    echo "This script requires below parameters:"
+    echo -e "Available parameter [task]: bss, impl\n"
+    echo -e "Usage: \e[36mbss_liquibase [release] [environment] [task]\e[0m\n"
+    exit 1
+fi
+
+#--------------------------------------------------------------------#
+#-------------------------- INPUT DATA ------------------------------#
+#--------------------------------------------------------------------#
+
+VARIABLE="$3" # variable is used before common configuration file is sourced
+
+# first parameter: STEP_NAME, second: DB_UPGRADE type, third: PACKAGE_NAME
+[ ${VARIABLE} = 'bss' ] && declare -a SCRIPT_CONF=('BS_liquibase_changeset' 'BS/PI TDP' 'bss-db*.zip')
+[ ${VARIABLE} = 'impl' ] && declare -a SCRIPT_CONF=('IMPL_liquibase_changeset' 'IMPL' '*_impl.zip')
+
+STEP_NAME="${SCRIPT_CONF[0]}"
+DB_UPGRADE="${SCRIPT_CONF[1]}"
+PACKAGE_NAME="${SCRIPT_CONF[2]}"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+declare -a JOB_ARR=("bss" "impl"); check_available_parameters ${VARIABLE} # check if induction parameters are consistent with the pattern
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep CPM | head -n1 | awk '{ print $6 }'`
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+SERVERS_PATH=${RHOME}/liquibase/changes/Liquibase_installation_`date +%Y-%m-%d`
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function copy_to_server() {
+    [ ${VARIABLE} = 'bss' ] && COMPONENT_PATH=${VERSION_DIR} || COMPONENT_PATH=${VERSION_DIR}/IMPL
+
+    fLog "Searching for ${DB_UPGRADE} liquibase changesets"
+    fLog `find ${COMPONENT_PATH} -name ${PACKAGE_NAME} | sort -V | while read -r line; do basename \`echo "${line%.zip}"\`; done > ${COMPONENT_PATH}/packages_bss`
+    fLog "Destination directory: ${SERVERS_PATH}"
+    run_remote_command ${HOST} "mkdir -p ${SERVERS_PATH}" # create required directories
+    RESULT=$(scp -pq ${COMPONENT_PATH}/packages_bss ${USER}@${HOST}:${SERVERS_PATH} 2>&1)
+    CODE=$?; check_errors
+    fLog "${DB_UPGRADE} changeset package list copied successfully"
+
+    fLog "${DB_UPGRADE} liquibase changeset copy"
+    fLog "Destination directory: ${SERVERS_PATH}"
+    RESULT=$(scp ${COMPONENT_PATH}/${PACKAGE_NAME} ${USER}@${HOST}:${SERVERS_PATH} 2>&1)
+    CODE=$?; check_errors
+    fLog "${DB_UPGRADE} liquibase changeset copied successfully"
+    
+    fLog "Copying ${DB_UPGRADE} upgrade script"
+    fLog "Destination directory: ${BIN_DIR}"
+    RESULT=$(scp -pq ${TOSERVERS_PATH}/upgrade_bs_db ${USER}@${HOST}:${BIN_DIR} 2>&1)
+    CODE=$?; check_errors
+    run_remote_command ${HOST} "chmod 764 ${BIN_DIR}/upgrade_bs_db"
+    fLog "${DB_UPGRADE} upgrade script copied successfully"
+}
+
+function liquibase_upgrade() {
+    fLog "${DB_UPGRADE} liquibase upgrade"
+    run_remote_command ${HOST} "upgrade_bs_db bamboo"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+    SERV=($SERVER)
+    if [[ "${SERV[0]}" = "$ENV" && "${SERV[1]}" = "CPM" && "${SERV[3]}" = "1" ]]; then # execute only on main CPM node
+        HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+        copy_to_server
+        liquibase_upgrade
+    fi
+done
+
+source ${BIN_PATH}/common_after

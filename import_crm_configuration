@@ -1,0 +1,197 @@
+#!/bin/bash -
+# CRM database definition importer tool by adam.chalat@comarch.com
+# importer is required on every CRM node, because of script upgrade.sh necessary for copy_extract_crm
+# parallel actions are disabled due to errors during signals catching
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="04.07.2017r."
+SCRIPT_VERSION="0.1.19"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common # load variables (required double load profile, when script variables are loaded)
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+    echo -e "\nCRM database definition importer tool by \e[32madam.chalat@comarch.com\e[0m"
+    echo -e "Version: \e[35m${SCRIPT_VERSION}\e[0m | Last modification: \e[35m${BUILD_DATE}\e[0m\n"
+    echo "This script requires below parameters:"
+    echo "Available parameter [environment]: `grep ^ENV_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+    echo -e "Available parameter [task]: bpm, organizations, customattributes, liferaylayouts, reportsfiles, importer\n"
+    echo -e "Usage: \e[36mimport_crm_configuration [release] [environment] [task]\e[0m\n"
+    exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------ PARAMETERS and PATHS ----------------------#
+#--------------------------------------------------------------------#
+
+RHOME=`grep -w ^"$2" ${SERVERS_ARR_FILE} | grep CRM | head -n1 | awk '{ print $6 }'` # common file is loaded later
+CONF_IMPORTER_DIR=${RHOME}/ConfigurationImporterPkg
+VARIABLE="$3" # variable is used before common configuration file is sourced
+
+#--------------------------------------------------------------------#
+#-------------------------- INPUT DATA ------------------------------#
+#--------------------------------------------------------------------#
+
+# first parameter: STEP_NAME, second: REMOTE_ZIP_DIR type, third: COMMAND
+[ ${VARIABLE} == 'bpm' ] && declare -a SCRIPT_CONF=("BPMProcessesFiles_import" "${CONF_IMPORTER_DIR}/processes" "./upgrade.sh -e")
+[ ${VARIABLE} == 'organizations' ] && declare -a SCRIPT_CONF=("Organizations_import" "${CONF_IMPORTER_DIR}/organizations" "./upgrade.sh -o")
+[ ${VARIABLE} == 'customattributes' ] && declare -a SCRIPT_CONF=("CustomAttributes_import" "${CONF_IMPORTER_DIR}/custom_attributes" "./upgrade.sh -t")
+[ ${VARIABLE} == 'liferaylayouts' ] && declare -a SCRIPT_CONF=("LiferayLayouts_import" "${CONF_IMPORTER_DIR}/layouts" "./upgrade.sh -l")
+[ ${VARIABLE} == 'reportsfiles' ] && declare -a SCRIPT_CONF=("ReportsFiles_import" "${CONF_IMPORTER_DIR}/reports" "./upgrade.sh -j")
+[ ${VARIABLE} == 'importer' ] && declare -a SCRIPT_CONF=("Configuration_importer_upgrade")
+
+STEP_NAME="${SCRIPT_CONF[0]}"
+REMOTE_ZIP_DIR="${SCRIPT_CONF[1]}"
+COMMAND="${SCRIPT_CONF[2]}"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+declare -a JOB_ARR=("bpm" "organizations" "customattributes" "liferaylayouts" "reportsfiles" "importer"); check_available_parameters ${VARIABLE} # check if induction parameters are consistent with the pattern
+check_source # check presence of repository source in repo-bin directory
+
+#--------------------------------------------------------------------#
+#----------------------------- PARAMETERS ---------------------------#
+#--------------------------------------------------------------------#
+
+FILELIST="${STEP_NAME%_*}.tar.gz"
+NAME="${STEP_NAME%_*}"
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function copy_importer_to_server() {
+    fLog "$(colored "34" "[ INFORMATION ]") Copying Configuration Importer"
+    fLog "Files: ConfigurationImporterPkg.tar.gz"
+    fLog "Destination directory: ${RHOME}"
+    rsync -vrltD --stats --human-readable -e ssh ${CRM_DIR}/ConfigurationImporterPkg.tar.gz ${USER}@${HOST}:${RHOME} # used rsync instead of scp, beacuase of partial output and better handling for large files
+    CODE=$?; check_errors
+    fLog "$(colored "32" "[ INFORMATION ]") Configuration Importer was copied successfully"
+}
+
+function change_importer_configuration() {
+	# ant should be added to PATH to avoid errors during import
+    run_remote_command ${HOST} -n "env | grep -q \"${SERV[5]}/ConfigurationImporterPkg/database\""
+    if [ $? -ne 0 ]; then
+        fLog "$(colored "31" "[ WARNING ]") Location ${SERV[5]}/ConfigurationImporterPkg/database/ has to be added to the PATH (required by Configuration Importer tool)"
+        stop_deployment "Location ${SERV[5]}/ConfigurationImporterPkg/database has to be added to the PATH"
+    fi
+
+	# add correct leads to JAVA_HOME directory, to default server paths and change log4j error level logging
+    fLog -n "Changing upgrade.conf and log4j properties"
+    run_remote_command ${HOST} "sed -i \"s|JAVA_HOME=.*|`echo $(run_remote_command ${HOST} 'echo JAVA_HOME=${JAVA_HOME}/bin' | tail -n1)`|g\" ${CONF_IMPORTER_DIR}/conf/upgrade.conf"
+    run_remote_command ${HOST} "sed -i \"s|pkg_path=.*|pkg_path=${RHOME}\/ConfigurationImporterPkg|g\" ${CONF_IMPORTER_DIR}/conf/upgrade.conf"
+    run_remote_command ${HOST} "sed -i \"s|backup_root=.*|backup_root=${RHOME}\/backups_servers|g\" ${CONF_IMPORTER_DIR}/conf/upgrade.conf"
+    run_remote_command ${HOST} "sed -i \"s|base_root_location=.*|base_root_location=${RHOME}\/servers|g\" ${CONF_IMPORTER_DIR}/conf/upgrade.conf"
+    run_remote_command ${HOST} "sed -i \"s/log4j.rootCategory.*/log4j.rootCategory = INFORMATION, R, NewFile/g\" ${CONF_IMPORTER_DIR}/conf/log4j.properties"
+    fLog "Changes for upgrade.conf and log4j were made successfully"
+}
+
+function importer_upgrade() {
+    CHECK_IMPORTER_PRESENCE=$(run_remote_command ${HOST} -n "[ -d ${CONF_IMPORTER_DIR} ]"); CODE=$?
+    if [ ${CODE} -eq 0 ]; then
+        run_remote_command ${HOST} "mkdir -p ${RHOME}/backups_servers" # create required directories
+        fLog "Creating backup of previous Configuration Importer"
+        RESULT=$(run_remote_command ${HOST} "tar -zcf ${RHOME}/backups_servers/$(date +'%s')_ConfigurationImporter_backup.tar.gz -C ${CONF_IMPORTER_DIR} .")
+        CODE=$?; check_errors
+        [[ -z ${CONF_IMPORTER_DIR} ]] && stop_deployment "Aborting deployment, because of lacking \${CONF_IMPORTER_DIR} variable" || :
+        run_remote_command ${HOST} "rm -rf ${CONF_IMPORTER_DIR}"
+    fi
+
+    fLog "$(colored "34" "[ INFORMATION ]") Upgrading Configuration Importer"
+    run_remote_command ${HOST} "tar -zxf ${RHOME}/ConfigurationImporterPkg.tar.gz -C ${RHOME}/"
+    run_remote_command ${HOST} "chmod 764 ${CONF_IMPORTER_DIR}/bin/upgrade.sh ${CONF_IMPORTER_DIR}/database/ant"
+    run_remote_command ${HOST} "rm -rf ${RHOME}/ConfigurationImporterPkg.tar.gz"
+
+    change_importer_configuration # importer configuration
+    fLog "$(colored "32" "[ INFORMATION ]") Configuration Importer upgrade was performed successfully"
+}
+
+function copy_to_server() {
+    [[ -z ${REMOTE_ZIP_DIR} ]] && stop_deployment "Aborting deployment, because of lacking \${REMOTE_ZIP_DIR} variable" || :
+    run_remote_command ${HOST} "rm -rf ${REMOTE_ZIP_DIR}/*" # cleaning target directory
+
+    fLog "$(colored "34" "[ INFORMATION ]") Copying ${NAME}"
+    fLog "Files: ${FILELIST}"
+    fLog "Destination directory: ${REMOTE_ZIP_DIR}"
+    RESULT=$(scp -pq ${CRM_DIR}/${FILELIST} ${USER}@${HOST}:${REMOTE_ZIP_DIR} 2>&1)
+    CODE=$?; check_errors
+    fLog "$(colored "32" "[ INFORMATION ]") ${NAME} copied successfully"
+}
+
+function extract_on_server() {
+    fLog "Extracting file ${FILELIST}"
+    run_remote_command ${HOST} "tar -xzf ${REMOTE_ZIP_DIR}/${FILELIST} -C ${REMOTE_ZIP_DIR}"
+    fLog "${FILELIST} file extracted successfully"
+
+    if [[ ${VARIABLE} = 'liferaylayouts' ]]; then
+        fLog "LiferayLayouts: organizing files structure"
+        run_remote_command ${HOST} "mkdir -p ${REMOTE_ZIP_DIR}/{'CRM','Administration'}"
+
+        for LIFERAY_COMPONENT in 'CRM.lar' 'Administration.lar'; do
+            tar -tf ${CRM_DIR}/${FILELIST} | grep -q ${LIFERAY_COMPONENT} && \
+            run_remote_command ${HOST} "mv ${REMOTE_ZIP_DIR}/${LIFERAY_COMPONENT} ${REMOTE_ZIP_DIR}/${LIFERAY_COMPONENT%.lar}/" || \
+            fLog -n "$(colored "31" "[ WARNING ]") Database ${LIFERAY_COMPONENT} definition file was not delivered with package"
+        done
+
+        fLog "LiferayLayouts structure organized successfully"
+    fi
+}
+
+function import_crm_definitions() {
+    function get_logfile_output() {
+        LOGFILE=$(run_remote_command ${HOST} "ls -t ${CONF_IMPORTER_DIR}/logs/import-* | head -1" | tail -n1) # get the latest database importer logfile
+        run_remote_command ${HOST} -n "grep -Fq '\[ERROR\]' ${LOGFILE}" >/dev/null # check for pattern 'ERROR' in logfile
+        if [ $? -eq 0 ]; then
+            fLog "$(colored "31" "[ WARNING ]") Detected errors during ${NAME} import"
+            run_remote_command ${HOST} "grep -w 'ERROR' ${LOGFILE}" # search only pattern ERROR
+            stop_deployment "Detected errors during ${NAME} import"
+        else
+            fLog "$(colored "32" "[ INFORMATION ]") ${NAME} imported successfully"
+        fi
+    }
+
+    trap 'get_logfile_output' EXIT # command arg is executed on exit from the shell (the same meaning as signal 0)
+    fLog "$(colored "34" "[ INFORMATION ]") ${NAME} import"
+    run_remote_command ${HOST} "cd ${CONF_IMPORTER_DIR}/bin; ${COMMAND}"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+    SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" ]] && [[ "${SERV[1]}" = "CRM" ]]; then 
+        HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+        if [[ ${VARIABLE} = 'importer' ]]; then
+            copy_importer_to_server
+            importer_upgrade
+        elif [[ "${SERV[3]}" = "1" ]]; then
+            copy_to_server
+            extract_on_server
+            change_importer_configuration
+            import_crm_definitions
+        fi
+    fi
+done
+
+wait
+source ${BIN_PATH}/common_after

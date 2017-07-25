@@ -1,0 +1,130 @@
+#!/bin/bash -
+# data upgrade tool by adam.chalat@comarch.com (supports migration and upgrade procedures)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="04.07.2017r."
+SCRIPT_VERSION="0.1.3"
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nData upgrade tool by \e[32madam.chalat@comarch.com\e[0m"
+	echo -e "Version: \e[35m${SCRIPT_VERSION}\e[0m | Last modification: \e[35m${BUILD_DATE}\e[0m\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [environment]: `grep ^ENV_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	echo -e "Available parameter [task]: dataupgrade, migration\n"
+	echo -e "Usage: \e[36m$(basename $0) [release] [environment] [task]\e[0m\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#-------------------------- INPUT DATA ------------------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="Data_upgrade"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+declare -a JOB_ARR=("dataupgrade" "migration"); check_available_parameters ${VARIABLE} # check if induction parameters are consistent with the pattern
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep CPM | head -n1 | awk '{ print $6 }'`
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+HOME_DIR=${RHOME}/servers
+RMQ_CONFIG=${RHOME}/rabbitmq/rabbitmq.config
+DATA_UPGRADE=${HOME_DIR}/launcher/current/bss-backend
+P7_PROPERTIES=${DATA_UPGRADE}/conf/p7.properties
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function change_configuration_file() {
+	fLog "Checking configuration for BSS-BACKEND - p7.properties"
+
+	RMQ_USER=$(run_remote_command ${HOST} grep default_user ${RMQ_CONFIG} | sed 's/">>.*//' | sed 's/.*<<"//g' | tail -n1)
+	RMQ_PASSWORD=$(run_remote_command ${HOST} grep default_pass ${RMQ_CONFIG} | sed 's/">>.*//' | sed 's/.*<<"//g' | tail -n1)
+	PORT=$(run_remote_command ${HOST} grep rabbitmq_management ${RMQ_CONFIG} | sed 's/}.*//' | sed 's/.*, //g' | tail -n1)
+
+    run_remote_command ${HOST} -n "grep -q 'rabbitMQ.p7.admin.uri=' ${P7_PROPERTIES}" # check if entry rabbitMQ.p7.admin.uri exists in config file (modify existing for user access)
+    [ $? = 1 ] && run_remote_command ${HOST} "grep rabbitMQ.p7.uri ${P7_PROPERTIES} | sed 's/.uri/.admin.uri/' >> ${P7_PROPERTIES}" || :
+    run_remote_command ${HOST} "sed -i -e \"s/rabbitMQ.p7.admin.uri=.*@/rabbitMQ.p7.admin.uri=amqp:\/\/${RMQ_USER}:${RMQ_PASSWORD}@/g\" ${P7_PROPERTIES}" # entry for the management port
+
+    run_remote_command ${HOST} -n "grep -q 'rabbitMQ.p7.managementPort=' ${P7_PROPERTIES}" # check if entry rabbitMQ.p7.managementPort exists in config file (create empty entry)
+    [ $? = 1 ] && run_remote_command ${HOST} "echo 'rabbitMQ.p7.managementPort=' >> ${P7_PROPERTIES}" || :
+    run_remote_command ${HOST} "sed -i -e \"s/rabbitMQ.p7.managementPort=.*/rabbitMQ.p7.managementPort=${PORT}/g\" ${P7_PROPERTIES}" # entry for data upgrade process (admin privileges)
+
+    fLog "Configuration for BSS-BACKEND was performed successfully"
+}
+
+function dataupgrade_migration() {
+	fLog "Checking, if all required files are present on target server"
+	for FILE in 'data-upgrade-for-migration.sh' 'setMessageBridgeBaseline.sh' 'createSchemaTables.sh' 'migrateEsTrxToDb.sh' 'reindex.sh'; do
+		[ ${FILE} == 'data-upgrade-for-migration.sh' ] && { RESULT=$(run_remote_command ${HOST} "[ -f ${DATA_UPGRADE}/bin/${FILE} ]"); CODE=$?; } || { RESULT=$(run_remote_command ${HOST} "[ -f ${DATA_UPGRADE}/scripts/${FILE} ]"); CODE=$?; }
+		if [[ ${CODE} -ne 0 ]]; then
+			fLog "$(colored "31" "[ WARNING ]") File ${FILE} does not exist in destination path"
+			stop_deployment "File ${FILE} does not exist in destination path"
+		fi
+	done
+
+	fLog "Processing customised dataupgrade process (ommision of models reconstruction)"
+	run_remote_command ${HOST} "cd ${DATA_UPGRADE}/bin; ./bin/data-upgrade-for-migration.sh"
+	run_remote_command ${HOST} "cd ${DATA_UPGRADE}/bin; ./scripts/setMessageBridgeBaseline.sh crm `grep ^${ENV}_DATAUPGRADE ${SERVERS_ARR_FILE} | awk '{print $2}'`"
+	run_remote_command ${HOST} "cd ${DATA_UPGRADE}/bin; ./scripts/setMessageBridgeBaseline.sh bs `grep ^${ENV}_DATAUPGRADE ${SERVERS_ARR_FILE} | awk '{print $3}'`"
+	run_remote_command ${HOST} "cd ${DATA_UPGRADE}/bin; ./scripts/setMessageBridgeBaseline.sh core `grep ^${ENV}_DATAUPGRADE ${SERVERS_ARR_FILE} | awk '{print $4}'`"
+	run_remote_command ${HOST} "cd ${DATA_UPGRADE}/bin; ./scripts/createSchemaTables.sh"
+	run_remote_command ${HOST} "cd ${DATA_UPGRADE}/bin; ./scripts/migrateEsTrxToDb.sh full"
+	run_remote_command ${HOST} "cd ${DATA_UPGRADE}/bin; ./scripts/migrateEsTrxToDb.sh files"
+	${BIN_DIR}/es_backup ${VERSION} ${ENV} es_reconstruction
+	run_remote_command ${HOST} "cd ${DATA_UPGRADE}/bin; ./scripts/reindex.sh all"
+	data_upgrade
+}
+
+function data_upgrade() {
+	function get_logfile_output() {
+		if [[ ${EXIT_STATUS} -ne 0 ]]; then
+			fLog "$(colored "31" "[ WARNING ]") Detected errors during dataupgrade process. Last 20 lines of ${UPGRADE_LOG_FILE} logfile."
+			run_remote_command ${HOST} "tail -n20 ${UPGRADE_LOG_FILE}"
+		fi
+	}
+
+	trap 'EXIT_STATUS=$?; get_logfile_output' EXIT # command arg is executed on exit from the shell (the same meaning as signal 0)
+	fLog -n "Processing data upgrade"
+	UPGRADE_LOG_FILE=${DATA_UPGRADE}/bin/dataUpgrade_`date +\%Y\%m\%d\%H\%M`.log
+	run_remote_command ${HOST} "cd ${DATA_UPGRADE}/bin; ./dataUpgrade.sh > ${UPGRADE_LOG_FILE} 2>&1"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+	SERV=($SERVER)
+	if [[ "${SERV[0]}" = "${ENV}" ]] && [[ "${SERV[1]}" = "CPM" ]] && [[ "${SERV[3]}" = "1" ]]; then
+		HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+		change_configuration_file
+		[[ ${VARIABLE} == 'migration' ]] && dataupgrade_migration
+		data_upgrade
+	fi
+done
+
+source ${BIN_PATH}/common_after

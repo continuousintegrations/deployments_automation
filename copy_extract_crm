@@ -1,0 +1,144 @@
+#!/bin/bash -
+# build_date=04.07.2017
+# script supports HOT_DEPLOY (variable ${DEPLOY_DIR}) - switch '--silent' is required at the end of script induction
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#------------------------- PARAMETERS -------------------------------#
+#--------------------------------------------------------------------#
+
+INPUT_METHOD="$3"
+[[ ${INPUT_METHOD} = 'embedded' ]] && STEP_NAME="CRM_copyextract_presentation" || STEP_NAME="CRM_copyextract" # change step name when copying embedded presentation
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep CRM | head -n1 | awk '{ print $6 }'`
+
+# distinction between running component deployment on running or stopped system
+[[ ${@: -1} == '--silent' ]] && \
+{ echo -e "$(colored "32" "[ INFORMATION ]") Detected additional 'silent' switch. Processing component deployment on running system."; DEPLOY_DIR='deployment_servers' ; } || \
+{ echo -e "$(colored "32" "[ INFORMATION ]") There is no additional switch in script induction. Running default component deployment."; DEPLOY_DIR='servers'; }
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+REMOTE_ZIP_DIR=${RHOME}/ConfigurationImporterPkg/dist/
+EMBEDDED_DIR=${RHOME}/servers/presentation/embedded
+BACKUP=${RHOME}/backups_servers
+CONF_IMPORTER_DIR=${RHOME}/ConfigurationImporterPkg
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function copy_to_server() {
+    fLog -n "$(colored "34" "[ INFORMATION ]") CRM binaries copy"
+    fLog "Files: $@"
+    fLog "Destination directory: ${REMOTE_ZIP_DIR}"
+    # used rsync instead of scp, beacuase of partial output and better handling for large files
+    rsync -vrltD --stats --human-readable -e ssh ${CRM_DIR}/{logic.tar.gz,presentation.tar.gz,esb.tar.gz,bpm.tar.gz} ${USER}@${HOST}:${REMOTE_ZIP_DIR}
+    CODE=$?; check_errors
+    fLog "$(colored "32" "[ INFORMATION ]") CRM binaries copied successfully"
+}
+
+function update_importer_configuration() {
+    fLog "$(colored "34" "[ INFORMATION ]") Changing upgrade.conf and log4j properties" # add correct leads to JAVA_HOME directory, to default server paths and change log4j error level logging
+    run_remote_command ${HOST} "sed -i \"s|JAVA_HOME=.*|`echo $(run_remote_command ${HOST} 'echo JAVA_HOME=${JAVA_HOME}/bin' | tail -n1)`|g\" ${CONF_IMPORTER_DIR}/conf/upgrade.conf"
+    run_remote_command ${HOST} "sed -i \"s|pkg_path=.*|pkg_path=${RHOME}\/ConfigurationImporterPkg|g\" ${CONF_IMPORTER_DIR}/conf/upgrade.conf"
+    run_remote_command ${HOST} "sed -i \"s|backup_root=.*|backup_root=${RHOME}\/backups_servers|g\" ${CONF_IMPORTER_DIR}/conf/upgrade.conf"
+    run_remote_command ${HOST} "sed -i \"s|base_root_location=.*|base_root_location=${RHOME}\/${DEPLOY_DIR}|g\" ${CONF_IMPORTER_DIR}/conf/upgrade.conf"
+    run_remote_command ${HOST} "sed -i \"s/log4j.rootCategory.*/log4j.rootCategory = INFORMATION, R, NewFile/g\" ${CONF_IMPORTER_DIR}/conf/log4j.properties"
+    fLog "$(colored "32" "[ INFORMATION ]") Changes for upgrade.conf and log4j were made successfully"
+}
+
+function update_configuration() {
+    LOGS_DIR=`grep ^LOGS_DIR ${SERVERS_ARR_FILE} | grep ${ENV} | awk '{print $NF}'` # default log path (corresponds with key LOGS_DIR in servers.arr)
+    RESULT=$(run_remote_command ${SERV[2]} "[ -e ${LOGS_DIR} ] && [ -h ${LOGS_DIR} ]"); CODE=$? # check if symlink and target path exist
+    if [ ${LOGS_DIR} ] && [ ${CODE} -eq 0 ]; then # check if proper key if definied for environment
+        fLog "Update configuration: change default logs leads" # change default ${RHOME}/logs path to custom
+        run_remote_command ${SERV[2]} "find ${RHOME}/servers/ -name 'run.conf' -exec sed -i.bak \"s|Xloggc:.*logs|Xloggc:${LOGS_DIR}|g\" {} +"
+        run_remote_command ${SERV[2]} "find ${RHOME}/servers/ -name 'run.conf' -exec sed -i.bak \"s|XX:HeapDumpPath=.*logs|XX:HeapDumpPath=${LOGS_DIR}|g\" {} +"
+        run_remote_command ${SERV[2]} "find ${RHOME}/servers/ -name 'logback.xml' -exec sed -i.bak \"s|<file>.*/logs/|<file>${LOGS_DIR}/|g\" {} +"
+        fLog "$(colored "32" "[ INFORMATION ]") Configuration update completed successfully"
+    fi
+}
+
+function extract_on_server() {
+    fLog "$(colored "34" "[ INFORMATION ]") CRM binaries deployment"
+    run_remote_command ${SERV[2]} "rm -rf ${RHOME}/{deployment_servers,deployment_backup}" # remove temporary directory used during HOT DEPLOY
+
+    # perform application backup only when 'HOT_DEPLOY' is disabled (backup is performed in different way) and 'CRM_BACKUP' is enabled (environment is listed)
+    ([[ `grep ^CRM_BACKUP ${SERVERS_ARR_FILE} | grep ${ENV}` ]] && [[ `grep ^${ENV}_CONFIGURATION ${SERVERS_ARR_FILE} | awk '{print $3}'` != 'HOT_DEPLOY' ]]) && \
+    run_remote_command ${SERV[2]} "${REMOTE_ZIP_DIR}../bin/upgrade.sh -bpi" || \
+    run_remote_command ${SERV[2]} "${REMOTE_ZIP_DIR}../bin/upgrade.sh -pi"
+    fLog "CRM binaries extracted successfully"
+
+    fLog "Updating version string" # removed script change_version.sh
+    CHECK_VER=$(basename `find ${VERSION_DIR} -name *-backend-*` .zip | sed 's/^.*-backend-/version-/') # add CRM version to footer (according to bss binaries in package)
+    FOOTER=`grep ^FOOTER ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`
+
+    [[ `grep ^CREATE_BUILD_VERSION ${SERVERS_ARR_FILE} | grep "${ENV}"` ]] && \
+    run_remote_command ${SERV[2]} "echo ${ENV} \`hostname -s\` `eval echo ${FOOTER}` CRM ${CHECK_VER} > ${RHOME}/${DEPLOY_DIR}/presentation/d10000conf_presentation/conf/build.ver" || \
+    run_remote_command ${SERV[2]} "sed -i.bak \"s|.*CRM.*version.*|${ENV} \`hostname -s\` `eval echo ${FOOTER}` CRM ${CHECK_VER}|g\" ${RHOME}/${DEPLOY_DIR}/presentation/d10000conf_presentation/conf/build.ver"
+    fLog "Version string updated successfully: $(colored "34" "${ENV} $(run_remote_command ${SERV[2]} "echo \`hostname -s\`" | tail -n1) `eval echo ${FOOTER}` CRM ${CHECK_VER}")"
+
+    update_configuration # execute inside, because function is running in background
+    fLog "$(colored "32" "[ INFORMATION ]") CRM upgrade performed successfully"
+}
+
+function copy_presentation() {
+    CRM_DIR=${SERV[5]}/servers/presentation
+    LOGBACK=${CRM_DIR}/embedded/lib/logback.xml
+    SERVERXML=${CRM_DIR}/embedded/conf/server.xml
+    CATALINA_PROPERTIES=${CRM_DIR}/embedded/conf/catalina.properties
+
+    fLog "Creating backup of embedded presentation" # create backup after checking if presentation exists and target directory is created
+    run_remote_command ${SERV[2]} "[ -d ${EMBEDDED_DIR} ] && mkdir -p ${BACKUP} && tar -czf ${BACKUP}/embedded_presentation__backup_`date +%Y-%m-%d-%H%M`.tar.gz ${EMBEDDED_DIR} || :"
+    [[ -z ${EMBEDDED_DIR} ]] && stop_deployment "Aborting deployment, because of lacking \${EMBEDDED_DIR} variable" || :
+    run_remote_command ${SERV[2]} "rm -rf ${EMBEDDED_DIR}"
+    fLog "Creating embedded presentation binaries"
+    run_remote_command ${SERV[2]} "cp -R ${CRM_DIR}/d10000conf_presentation ${CRM_DIR}/embedded"
+    fLog "Configuring CRM embedded values"
+    run_remote_command ${SERV[2]} "sed -i -- 's/crm_presentation/crm_presentation_embedded/g' ${EMBEDDED_DIR}/conf/logback.xml"
+    run_remote_command ${SERV[2]} "sed -i -- 's/mode.external=.*/mode.external=true/g' ${EMBEDDED_DIR}/conf/catalina.properties"
+    # ' end first quotation which uses single quotes; " start second quotation, using double-quotes; ' quoted character; \" end second quotation, using double-quotes.
+    run_remote_command ${SERV[2]} "sed -i -- 's/redirectPort='"'\"8443\"'"'/redirectPort='"'\"8445\"'"'/g' ${EMBEDDED_DIR}/conf/server.xml"
+    run_remote_command ${SERV[2]} "sed -i -- 's/port='"'\"10000\"'"'/port='"'\"15000\"'"'/g' ${EMBEDDED_DIR}/conf/server.xml"
+    run_remote_command ${SERV[2]} "sed -i -- 's/port='"'\"10001\"'"'/port='"'\"15001\"'"'/g' ${EMBEDDED_DIR}/conf/server.xml"
+    run_remote_command ${SERV[2]} "sed -i -- 's/port='"'\"10005\"'"'/port='"'\"15005\"'"'/g' ${EMBEDDED_DIR}/conf/server.xml"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+    SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "CRM" ]]; then
+        USER="${SERV[4]}"; HOST="${SERV[2]}"
+
+        if [[ ${INPUT_METHOD} = 'embedded' ]] && [[ `grep ^PARALLEL_PRESENTATIONS ${SERVERS_ARR_FILE} | grep "${ENV}"` ]]; then
+            copy_presentation # deploying embedded CRM presentation
+        else
+            copy_to_server "logic.tar.gz presentation.tar.gz esb.tar.gz bpm.tar.gz"
+            update_importer_configuration
+            extract_on_server &
+        fi
+    fi
+done
+
+wait
+source ${BIN_PATH}/common_after

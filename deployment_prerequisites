@@ -1,0 +1,202 @@
+#!/bin/bash -
+# build_date=18.07.2017
+# during each deployment configuration files: .bash_profile, .bashrc, servers.arr and location_finder are updated
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="Deployment_prerequisites"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+
+#--------------------------------------------------------------------#
+#-------------------------- FUNCTIONS -------------------------------#
+#--------------------------------------------------------------------#
+
+function check_webservices() {
+	fLog "$(colored "34" "[ INFORMATION ]") Checking services availability (JFrog Artifactory, Atlassian Bamboo and GitLAB)"
+	for SERVICES_AVAILABILITY in `grep ^REMOTE_SERVICES ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`; do
+		SERVICE_NAME=${SERVICES_AVAILABILITY%:*}; SERVICE_PORT=${SERVICES_AVAILABILITY#*:}
+		STATUS_CHECK=$(nmap ${SERVICE_NAME} -p ${SERVICE_PORT} | grep -P "(?=.*^${ZK_SERVER_PORT}.*open.*)")
+		if [[ $? -eq 0 ]]; then
+			fLog "Service ${SERVICE_NAME^^} on port ${SERVICE_PORT} is available"
+		else
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Service ${SERVICE_NAME^^} on port ${SERVICE_PORT} is unavailable (port is closed)"
+			stop_deployment "Service ${SERVICE_NAME^^} on port ${SERVICE_PORT} is unavailable (port is closed)"
+		fi
+	done
+}
+
+function check_ssh_connection() {
+	SSH_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${USER}@${HOST} echo confirmed 2>&1)
+	if [[ ${SSH_STATUS} =~ 'confirmed' ]] ; then
+		fLog "SSH connection to remote host is open. Processing verification."
+	elif [[ ${SSH_STATUS} =~ "Permission denied" ]]; then
+		fLog "$(colored "31" "[ CRITICAL ERROR ]") SSH connection to remote host is denied - lacking authorization. Aborting deployment."
+		stop_deployment "SSH connection to remote host: ${USER}@${HOST} is denied - lacking authorization"
+	else
+		fLog -n "$(colored "31" "[ CRITICAL ERROR ]") SSH connection to remote host is denied. Aborting deployment."
+		stop_deployment "SSH connection to remote host: ${USER}@${HOST} is denied"
+	fi
+}
+
+function environment_configuration() {
+    # key '${ENV}_CONFIGURATION' with subkey 'CHECK_TERMINAL_CONF' has to be added to servers.arr if environment validation is mendatory (.bash_profile file)
+    if [[ `grep ^${ENV}_CONFIGURATION ${SERVERS_ARR_FILE} | awk '{print $2}'` == 'CHECK_TERMINAL_CONF' ]]; then
+        run_remote_command ${HOST} -n "test \`tail -c1 ~/.bash_profile\`" &>/dev/null # check, if at the end of file exists newline
+        [ "$?" -eq 0 ] && run_remote_command ${HOST} "echo >> ~/.bash_profile"
+
+        run_remote_command ${HOST} -n "grep -q "'\$'{HOME}/bin" ~/.bash_profile" &>/dev/null # add ~/bin variable to .bash_profile
+        [ "$?" -ne 0 ] && run_remote_command ${HOST} "echo \"export PATH=\$PATH:\$HOME/bin\" >> ~/.bash_profile"
+    else
+    	fLog -n "$(colored "31" "[ WARNING ]") Skipping validation of environment's configuration (.bash_profile file)"
+    fi
+
+    if [[ `grep ^REQUIRED_JAVA ${SERVERS_ARR_FILE} | grep "${SERV[1]}"` ]]; then
+        # verify PATH variable and leads for JAVA, JRE and ~/bin 
+        run_remote_command ${HOST} -n "env | grep -qP \"(?=^PATH.*/java/.*/bin.*)(?=^PATH.*/java/.*/jre/bin.*)(?=^PATH.*\${HOME}/bin.*)\"" &>/dev/null; CODE=$?
+        if [[ ${CODE} -ne 0 ]]; then 
+        	fLog "$(colored "31" "[ WARNING ]") Environment's configuration is incorrect. PATH variable needs to be corrected"
+        	fLog "$(colored "31" "[ WARNING ]") Necessary leads for Java, Java Runtime Environment and \${HOME}/bin should be supplemented"
+        	stop_deployment "Environmnet configuration is incorrect. PATH variable needs to be corrected"
+        fi
+
+        # check leads for JAVA and JRE (Java Runtime environment)
+        run_remote_command ${HOST} -n "env | grep -q \"JAVA_HOME=.*/java/.*\" && env | grep -q \"JRE_HOME=.*/java/.*/jre\"" &>/dev/null; CODE=$?
+        if [[ ${CODE} -ne 0 ]]; then 
+        	fLog "$(colored "31" "[ WARNING ]") Environment's configuration is incorrect. JAVA_HOME and JRE_HOME variables needs to be set"
+        	stop_deployment "Environmnet configuration is incorrect. JAVA_HOME and JRE_HOME variables needs to be corrected"
+        fi
+
+        # check Java version (key 'REQUIRED_JAVA' has to be added to servers.arr if environment validation is mendatory)
+        CHECK_JAVA_VERSION=`run_remote_command ${HOST} "java -version 2>&1" | awk -F '"' '/java version/ {print $2}' | cut -c1-3 | tr -d .`
+        if [[ ${CHECK_JAVA_VERSION} -lt `grep ^REQUIRED_JAVA ${SERVERS_ARR_FILE} | awk '{print $2}'` ]]; then
+        	fLog "$(colored "31" "[ WARNING ]") Current Java version is lower than required `grep ^REQUIRED_JAVA ${SERVERS_ARR_FILE} | awk '{print $2}' | awk '$1=$1' FS= OFS="."`"
+        	stop_deployment "Current Java version is lower than required `grep ^REQUIRED_JAVA ${SERVERS_ARR_FILE} | awk '{print $2}' | awk '$1=$1' FS= OFS="."`"
+        fi
+    else
+    	fLog -n "$(colored "31" "[ WARNING ]") Skipping validation of environment's variables related to JAVA"
+    fi
+    fLog "Validation of environment's configuration performed successfully"
+}
+
+function check_available_space() {
+	if [[ `run_remote_command ${HOST} "df -kP ${SERV[5]}" | tail -n1 | awk '{print $4}'` -lt 10485760 ]]; then # required free space 10GB (10*1024*1024k)
+		fLog "$(colored "31" "[ WARNING ]") Required space: $(colored "34" "10G"). Available space: `run_remote_command ${HOST} "df -hP ${SERV[5]}" | tail -n1 | echo $(colored "34" "$(awk '{print $4}')")`."
+		fLog "$(colored "31" "[ WARNING ]") There is not enough space on the ${HOST} host (free space has to be restored manually)"
+		stop_deployment "There is not enough free space on the ${HOST} host"
+	else
+		fLog -n "Host has enough free disk space: `run_remote_command ${HOST} "df -hP ${SERV[5]}" | tail -n1 | awk '{print $4}'` (10G required for deployment)"
+	fi
+}
+
+function required_linux_commands() {
+	LINUX_COMMAND_ERROR=0 # reset to original state
+	for LINUX_COMMAND in `grep ^REQUIRED_LINUX_COMMANDS ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`; do
+		RESULT=$(run_remote_command ${HOST} -n "which ${LINUX_COMMAND}")
+		if [[ $? -ne 0 ]]; then
+			fLog "$(colored "31" "[ WARNING ]") ${LINUX_COMMAND^^} command is not available on server"
+			LINUX_COMMAND_ERROR=1
+		fi
+	done
+
+	[[ ${LINUX_COMMAND_ERROR} -eq 0 ]] && fLog "Required linux commands, necessary for deployment, are present on host" || {
+		fLog "$(colored "31" "[ CRITICAL ERROR ]") Lacking linux commands should be installed on ${USER}@${HOST} server"
+		stop_deployment "Lacking linux commands should be installed on ${USER}@${HOST} server"
+	}
+}
+
+function terminate_processes() {
+	fLog "Killing applications management scripts and remaining logfiles read processes"
+	RESULT=$(run_remote_command ${HOST} -n "ps -fu \`whoami\` | grep \"[^]]mubemanage\" | awk "'"{printf \"%s \", \$2}"'" | xargs kill -9 &>/dev/null") # kill remaining mangagement scripts
+	RESULT=$(run_remote_command ${HOST} -n "ps -fu \`whoami\` | grep \"[aif,bpc,es,crm,bss,dps,tum,rmq,jr,zk]_manage\" | awk "'"{printf \"%s \", \$2}"'" | xargs kill -9 &>/dev/null")
+	RESULT=$(run_remote_command ${HOST} -n "ps -fu \`whoami\` | grep -w \"[t]ail\|[l]ess\" | awk "'"{printf \"%s \", \$2}"'" | xargs kill -9 &>/dev/null") # kill remaining read files processes
+}
+
+function check_apps_availability() {
+	if [[ `grep ^${ENV}_CONFIGURATION ${SERVERS_ARR_FILE} | awk '{print $5}'` == 'CHECK_APPS' ]]; then
+		if [[ "${SERV[1]}" == 'CPM' && "${SERV[3]}" = "1" ]]; then
+			fLog "Checking status of 3rd party applications"
+			for APP in es:ElasticSearch rmq:RabbitMQ; do
+				APP_INDUCTION=${APP%:*}; APP_NAME=${APP#*:}
+				${BIN_PATH}/server_manage ${APP_INDUCTION} status ${ENV}; CODE=$?
+				if [[ ${CODE} -eq 0 ]]; then
+					fLog "$(colored "32" "[ INFORMATION ]") ${APP_NAME} is working correctly"
+				else
+					fLog -n "$(colored "31" "[ CRITICAL ERROR ]") Errors occured during ${APP_NAME} status verification (application requires user attention)"
+					stop_deployment "Errors occured during ${APP_NAME} status verification"
+				fi
+			done
+		fi
+	else
+		fLog -n "$(colored "31" "[ WARNING ]") Status verification for ElasticSearch and RabbitMQ applications is disabled"
+	fi
+}
+
+function obsolete_files_archive_logs() {
+	[[ `grep ^EXPIRE_TIME ${SERVERS_ARR_FILE} | awk '{print $(NF-1)}'` != 'TRUE' ]] && fLog "$(colored "31" "[ WARNING ]") Obsolete files removal mechanism is disabled" || {
+		fLog "$(colored "32" "[ INFORMATION ]") Executing obsolete files removal mechanism"
+		run_remote_command ${HOST} "data_retention remove_obsolete_files ${ENV} $(grep ^ROOT_PASS prepare_environment | cut -d"=" -f2 | sed "s|'||g")"
+	}
+
+	[[ `grep ^EXPIRE_TIME ${SERVERS_ARR_FILE} | awk '{print $NF}'` != 'TRUE' ]] && fLog "$(colored "31" "[ WARNING ]") Logfiles archiving mechanism is disabled" || {
+		fLog "$(colored "32" "[ INFORMATION ]") Executing logfiles archiving mechanism"
+		run_remote_command ${HOST} "data_retention archive_logs ${ENV} $(grep ^ROOT_PASS prepare_environment | cut -d"=" -f2 | sed "s|'||g")"
+	}
+}
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTION CALL --------------------------#
+#--------------------------------------------------------------------#
+
+check_webservices # validate services availability
+
+STANDALONE_PROCESSES=$(ps -fu `whoami` | grep -P "(?=.*[^]]server_manage.*)(?=.*${ENV}.*)" | awk '{printf "%s ", $2}')
+if [[ ${STANDALONE_PROCESSES} ]]; then
+	fLog "$(colored "34" "[ WARNING ]") Killing standalone applications management processes with PIDs: ${STANDALONE_PROCESSES}"
+	kill -9 ${STANDALONE_PROCESSES} &>/dev/null
+fi
+
+fLog "\n$(colored "34" "[ INFORMATION ]") Removing existing semaphore PID files in case of incorrect script inductions"
+rm -rf ${LOGS_DIR}/semaphore/${ENV}/*
+
+fLog "$(colored "34" "[ INFORMATION ]") Updating: server configuration files and application management tools"
+${BIN_PATH}/prepare_environment ${ENV} update-scripts >/dev/null # update deployment scripts and configuration files
+
+if [[ $? -ne 0 ]]; then
+	fLog "\n$(colored "31" "[ CRITICAL ERROR ]") Errors occured during server configuration files update process ( please contact ITOPS department )"
+	fLog "$(colored "31" "[ CRITICAL ERROR ]") More details can be available by executing script directly ( `basename ${BIN_PATH}/prepare_environment` ${ENV} update-scripts )"
+	stop_deployment "Errors occured during executing prepare_environment script"
+fi
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+	SERV=($SERVER)
+	if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" =~ ^(CPM|CRM|DPS|BPC|TUM|AIF)$ ]]; then
+		HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+		fLog "\n$(colored "34" "[ INFORMATION ]") Currently checked: ${SERV[1]} user on ${ENV} environment (${SERV[6]} host)"
+		check_ssh_connection
+		environment_configuration
+		check_available_space
+		required_linux_commands
+		terminate_processes
+		check_apps_availability
+		obsolete_files_archive_logs
+		fLog "$(colored "32" "[ CONFIRMATION ]") Verification was successfully performed for ${SERV[1]} user on ${ENV} environment"
+	fi
+done
+
+source ${BIN_PATH}/common_after

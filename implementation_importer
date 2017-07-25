@@ -1,0 +1,168 @@
+#!/bin/bash -
+# Implementation importer tool by adam.chalat@comarch.com
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="04.07.2017r."
+SCRIPT_VERSION="0.1.10"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common # load variables (required double load profile, when script variables are loaded)
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+    echo -e "\nImplementation importer tool by \e[32madam.chalat@comarch.com\e[0m"
+    echo -e "Version: \e[35m${SCRIPT_VERSION}\e[0m | Last modification: \e[35m${BUILD_DATE}\e[0m\n"
+    echo "This script requires below parameters:"
+    echo "Available parameter [environment]: `grep ^ENV_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+    echo -e "Available parameter [task]: offer, BusinessRequest\n"
+    echo -e "Usage: \e[36mimplementation_importer [release] [environment] [task]\e[0m\n"
+    exit 1
+fi
+
+#--------------------------------------------------------------------#
+#-------------------------- INPUT DATA ------------------------------#
+#--------------------------------------------------------------------#
+
+INPUT_METHOD="$3"
+
+# first parameter: STEP_NAME, second: OFFER_PATCH type, third: BOOT_SCRIPTS
+[ ${INPUT_METHOD} = 'offer' ] && declare -a SCRIPT_CONF=("Load_and_publish_offer" "servers/offer" "TSLoadDelta.cpml")
+[ ${INPUT_METHOD} = 'BusinessRequest' ] && declare -a SCRIPT_CONF=("Load_and_publish_BusinessRequest" "servers/BusinessRequest" "BRLoadOffer.cpml") # case sensitive
+
+STEP_NAME="${SCRIPT_CONF[0]}"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+declare -a JOB_ARR=("offer" "BusinessRequest"); check_available_parameters ${INPUT_METHOD} # check if induction parameters are consistent with the pattern
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep CPM | head -n1 | awk '{ print $6 }'`
+
+OFFER_PATCH="${RHOME}/${SCRIPT_CONF[1]}"
+BOOT_SCRIPTS="${SCRIPT_CONF[2]}"
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+SERVERS_PATH=${RHOME}/servers/launcher/current/bss-backend
+PUBL_STAT=${VERSION_DIR}/publication_status.py
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function copy_to_server() {
+    REPO_PACKAGE=`find ${VERSION_DIR}/${INPUT_METHOD} -name ${VERSION}_${INPUT_METHOD}.tar.gz`
+    run_remote_command ${HOST} "mkdir -p ${OFFER_PATCH}/${VERSION}" # create needed directories
+
+    fLog "Copying ${INPUT_METHOD} binaries"
+    fLog "Destination directory: ${OFFER_PATCH}"
+    RESULT=$(scp ${REPO_PACKAGE} ${USER}@${HOST}:${OFFER_PATCH} 2>&1)
+    CODE=$?; check_errors
+    fLog "$(colored "32" "[ INFORMATION ]") ${INPUT_METHOD^} binaries were copied successfully"
+}
+
+function extract_implementation_package() {
+    fLog "Extracting ${INPUT_METHOD}"
+    ([[ -z ${OFFER_PATCH} ]] || [[ -z ${VERSION} ]]) && stop_deployment "Aborting deployment, because of lacking \${OFFER_PATCH} variable" || :
+    run_remote_command ${HOST} "rm -rf ${OFFER_PATCH}/${VERSION}/*"
+    run_remote_command ${HOST} "tar -xzf ${OFFER_PATCH}/`basename ${REPO_PACKAGE}` --strip 1 -C ${OFFER_PATCH}/${VERSION}"
+    fLog "$(colored "32" "[ INFORMATION ]") ${INPUT_METHOD^} was extracted successfully"
+}
+
+function prepare_configuration_file() {
+    fLog "Preparing proper configuration file for checking the status of offer publication"
+    declare -a ES_ADDRESS=(`grep ^${ENV}_ES ${SERVERS_ARR_FILE}`)
+    sed "s/es = Elasticsearch.*/es = Elasticsearch([\'${ES_ADDRESS[1]}\'], http_auth=(\'${ES_ADDRESS[2]}\', \'${ES_ADDRESS[3]}\'))/g" ${TOSERVERS_PATH}/publication_status.py > ${PUBL_STAT}
+
+    if [ -z ${ES_ADDRESS} ]; then
+        fLog "$(colored "31" "[ WARNING ]") There is missing configuration for ${ENV} environment"
+        fLog "$(colored "31" "[ WARNING ]") Please add row ${ENV}_ES with three parameters: elasticsearch address, username and password"
+        stop_deployment "There is missing configuration for ${ENV} environment"
+    fi
+}
+
+function check_publication() {
+    prepare_configuration_file # prepare configuration file for checking offer publication status (publication_status.py)
+
+    fLog "Checking offer publication status"
+    sleep 30
+    counter=1
+    while [ "${PUB_STATUS}" != "0" ]; do
+        fLog "[$counter out of 15] Waiting until publication will be finished - $((120*$counter))sec"
+        sleep 120
+        [ `python $PUBL_STAT | grep publishingprocess_PublishingProcessState_Done | wc -l` -eq 1 ]; PUB_STATUS=$?
+
+        counter=$(($counter+1))
+        if [ $counter -eq 15 ]; then
+            fLog "$(colored "31" "[ WARNING ]") Offer publication was unsuccessfully performed"
+            stop_deployment "Offer publication was unsuccessfully performed"
+        fi
+    done
+    fLog "$(colored "32" "[ INFORMATION ]") Offer publication was completed successfully"
+}
+
+function run_publication_process() {
+    function get_logfile_output() {
+        if grep -Pq "(?=.*?IMPLEMENTATION)(?=.*?${ENV})" ${SERVERS_ARR_FILE}; then
+            fLog "Checking status of ${INPUT_METHOD} load and publication process"
+
+            # search for entry 'ERROR' and output last 10 lines of logs
+            RESULT=$(run_remote_command ${HOST} -n "grep -q 'ERROR' ${SERVERS_PATH}/${STEP_NAME,,}_${VERSION}_${TIMESTAMP}.log"); CODE_1=$?
+            # search for entry 'Publication finished at' and if not exist output last 10 lines of logs
+            RESULT=$(run_remote_command ${HOST} -n "grep -q \"Publication finished at\" ${SERVERS_PATH}/${STEP_NAME,,}_${VERSION}_${TIMESTAMP}.log"); CODE_2=$?
+
+            if [[ ${CODE_1} -eq 0 ]] || [[ ${CODE_2} -ne 0 ]]; then
+                fLog "$(colored "31" "[ WARNING ]") ${INPUT_METHOD^} process completed with errors"
+                fLog "$(colored "31" "[ WARNING ]") Last 10 lines of ${STEP_NAME,,}_${VERSION}_${TIMESTAMP} logfile output"
+                [[ ${CODE_1} -eq 0 ]] && \
+                run_remote_command ${HOST} "grep --after-context=10 -n ERROR ${SERVERS_PATH}/${STEP_NAME,,}_${VERSION}_${TIMESTAMP}.log" || \
+                run_remote_command ${HOST} "tail -n10 ${SERVERS_PATH}/${STEP_NAME,,}_${VERSION}_${TIMESTAMP}.log"
+                stop_deployment "${INPUT_METHOD^} process completed with errors"
+            fi
+            fLog "$(colored "32" "[ INFORMATION ]") ${INPUT_METHOD^} load and publication process completed successfully"
+        else
+            check_publication # for systems lower than 7.1
+        fi
+    }
+
+    trap 'get_logfile_output' EXIT # command arg is executed on exit from the shell (the same meaning as signal 0)
+    fLog "Running ${INPUT_METHOD} load and publication process"
+    TIMESTAMP=`date +%H%M%S`
+
+    run_remote_command ${HOST} "chmod 764 ${OFFER_PATCH}/${VERSION}/${BOOT_SCRIPTS}" # add executable permissions
+    run_remote_command ${HOST} "cd ${SERVERS_PATH}; ./scripts/pmlCli.sh conf/p7.properties ${OFFER_PATCH}/${VERSION}/${BOOT_SCRIPTS} --mode=publish > ${STEP_NAME,,}_${VERSION}_${TIMESTAMP}.log 2>&1"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}" ; do
+    SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "CPM" && "${SERV[3]}" = "1" ]]; then # execute only on main CPM node
+        HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+        copy_to_server
+        extract_implementation_package
+        run_publication_process
+    fi
+done
+
+source ${BIN_PATH}/common_after

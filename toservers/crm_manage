@@ -1,0 +1,576 @@
+#!/bin/bash -
+# CRM control tool by adam.chalat@comarch.com (based on rafal.najman@comarch.com script)
+# ignore switch current when showing components status (comprehensive picture of application)
+# embedded presentation and esb11k are managed by strings: PARALLEL_PRESENTATIONS and ESB_11000 in servers.arr
+# consideration of the HA environment requires adding variable to HA_RELEASE entry in servers.arr
+# default ports are defined in servers.arr as key: CRM_PORTS 
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="24.07.2017r."
+SCRIPT_VERSION="0.5.29"
+
+PID_FILE=~/bin/PID_files/$(basename $0).pid
+CURRENT_USER=${USER}
+
+source ~/bin/location_finder
+
+# terminate all child processes if TERM signal is send and remove PID file on exit
+trap 'rm -f -- ${PID_FILE}; echo -e "$(colored "31" "[ WARNING ]") Terminating CRM child processes of parent $$ PID (configuration and environment should be veryfied)"; pkill -TERM -P $$; kill -9 $$' SIGINT SIGTERM SIGKILL
+
+# option used for the needs of mubemanage script (gather current version)
+[[ $1 == '--version' ]] && { cat ${SHOW_DEFAULT_PATH}/servers/presentation/d10000conf_presentation/conf/build.ver | awk '{print $NF}' | sed 's|version-||'; exit 0; }
+
+#--------------------------------------------------------------------#
+#---------------------------- PARAMETERS ----------------------------#
+#--------------------------------------------------------------------#
+
+SERVER_NAME=${1,,}
+JOB=${2,,}
+ENV_NAME=${3^^}
+CUR_NAME=${4,,}
+PARENT_PID=$$
+NOERROR=`echo "${@: -1}"` # avoid getting errors, when using server_manage (--noerror)
+
+#--------------------------------------------------------------------#
+#-------------------------- HELP FUNCTION ---------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nCRM control tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [server]: `grep ^CRM_APPS ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	echo "Available parameter [task]: start, stop, restart, status"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	echo -e "Available parameter [node]: current (optional - only for current node)\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [server] [task] [environment] [node]")\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- CHECK PARAMETERS -------------------------#
+#--------------------------------------------------------------------#
+
+declare -a SERVER_NAME_ARR=(`grep ^CRM_APPS ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`)
+declare -a JOB_ARR=("start" "stop" "restart" "status")
+
+if [[ -z $(echo "${SERVER_NAME_ARR[@]:0}" | grep -w ${SERVER_NAME}) ]]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong parameter. Please see below"
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Available parameters [server]: `grep ^CRM_APPS ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`\n"
+	exit 1
+elif [[ -z $(echo "${JOB_ARR[@]:0}" | grep -w ${JOB}) ]]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong parameter. Please see below."
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Available parameters [task]: start, stop, restart, status\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------ PATHS AND VARIABLES -----------------------#
+#--------------------------------------------------------------------#
+
+LOGS_PATH=${SHOW_DEFAULT_PATH}/logs/`date +%Y`/`date +%m`/`date +%d`
+# change logs directory if required key is present in configuration servers.arr file
+[[ `grep ^LOGS_DIR ~/bin/servers.arr | grep "${ENV_NAME}"` ]] && LOGS_PATH=`grep ^LOGS_DIR ~/bin/servers.arr | grep "${ENV_NAME}" | awk '{print $2}'`
+
+SERVERS_PATH=${SHOW_DEFAULT_PATH}/servers
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/crm_manage
+LOCK_PRESENTATION_FILE=${SERVERS_PATH}/w4presentation.lock
+
+PRESENTATION_HTTP_PORT=$(grep ^presentation.connector.port ~/bin/values.properties | sed 's/[^0-9]*//g')
+PRESENTATION_HTTPS_PORT=$(grep ^presentation.connector.https.port ~/bin/values.properties | sed 's/[^0-9]*//g')
+ERROR=0 # reset to original state (used during status check)
+
+#--------------------------------------------------------------------#
+#------------------------- KILLING FUNCTION -------------------------#
+#--------------------------------------------------------------------#
+
+function KILLING() {
+	echo -e "\n$(colored "34" "[ INFORMATION ]") Shutting down CRM components on ${IP_ADDRESS} ( ${HOSTNAME} )"
+	processes=`ps -fu ${USER} | grep java | grep 'd1*000\|embedded' | head -n1 | awk '{ print $2 }'`
+	
+	if [[ -z $processes ]]; then
+		echo -e "CRM components are $(colored "31" "not working") currently on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	else
+		[[ ${SERVER_NAME} == 'all' ]] && PROCESS_KILL "d1*000\\|embedded"
+		[[ ${SERVER_NAME} == 'logic' ]] && PROCESS_KILL "d10000conf_logic"
+		[[ ${SERVER_NAME} =~ ^(logic|presentation)$ ]] && PROCESS_KILL "d10000conf_presentation"
+		[[ ${SERVER_NAME} =~ ^(logic|presentation)$ ]] && PROCESS_KILL "embedded"
+		[[ ${SERVER_NAME} == 'batch' ]] && PROCESS_KILL "d10000batch_conf_logic"
+		[[ ${SERVER_NAME} =~ ^(bpm|batch)$ ]] && PROCESS_KILL "d10000conf_bpm"
+		[[ ${SERVER_NAME} =~ ^(esb10k|bpm|batch)$ ]] && PROCESS_KILL "d10000conf_esb"
+		[[ ${SERVER_NAME} == 'esb11k' ]] && PROCESS_KILL "d11000conf_esb"
+	fi
+}
+
+function PROCESS_KILL() {
+	ps -fu ${USER} | grep java | grep $1 | awk '{print $2}' | xargs kill &>/dev/null # kill despite reported bugs
+	sleep 5; counter=0
+	
+	while [ 1 ]; do
+		processes=`ps -fu ${USER} | grep java | grep $1 | awk '{printf "%s ", $2}'`
+		[ -z "$processes" ] && break || echo -e "$(colored "31" "Remaining PIDs:")" $processes"on ${IP_ADDRESS} ( ${HOSTNAME} )"
+		
+		if [ ${counter} -eq 2 ]; then
+			echo -e "$(colored "31" "Force killing for remaining PIDs:") $processes on ${IP_ADDRESS} ( ${HOSTNAME} )"
+			ps -fu ${USER} | grep java | grep $1 | grep -v grep | awk '{print $2}' | xargs kill -9 &>/dev/null
+			echo -e "Successfully force killed PIDs: ${SERVER_NAME} on ${IP_ADDRESS} ( ${HOSTNAME} )"
+			break
+		fi
+		
+		counter=$((counter+1))
+		sleep 30
+	done
+	
+	[[ ${SERVER_NAME} == 'all' ]] && rm -f ~/bin/PID_files/{d1?000*,embedded}.pid || rm -f ~/bin/PID_files/${1}.pid # remove PID files
+}
+
+#--------------------------------------------------------------------#
+#------------------------ RESTARTING FUNCTION -----------------------#
+#--------------------------------------------------------------------#
+
+function RESTARTING() {
+	[[ ${SERVER_NAME} =~ ^(all|presentation)$ ]] && PRESENTATION_RESTART
+	if [[ `grep ^HA_RELEASE ~/bin/servers.arr | grep "${ENV_NAME}"` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]; then # checking if release is equal HA to check components status on additional nodes
+		[[ ${SERVER_NAME} =~ ^(all|batch)$ ]] && PROCESS_RESTART "-c d10000batch_conf_logic" "batch_logic" "logic" "d10000batch_conf_logic"
+		[[ ${SERVER_NAME} =~ ^(all|batch|bpm)$ ]] && PROCESS_RESTART "-c d10000conf_bpm" "bpm" "bpm" "d10000conf_bpm"
+		if [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]; then # condition to check components status on main node (do not start these components on rest of nodes)
+			[[ ${SERVER_NAME} =~ ^(all|batch|bpm|esb10k)$ ]] && PROCESS_RESTART "-b 0.0.0.0 -c d10000conf_esb" "esb10000" "esb" "d10000conf_esb" # full component name, because of searched logile and output
+			([[ `grep ^ESB_11000 ~/bin/servers.arr | grep "${ENV_NAME}"` ]] && [[ ${SERVER_NAME} =~ ^(all|esb11k)$ ]]) && PROCESS_RESTART "-b 0.0.0.0 -c d11000conf_esb" "esb11000" "esb" "d11000conf_esb"
+		fi
+	fi
+}
+
+function FIND_LOG() {
+	if ! [ -e "${logfile}" ]; then
+		echo -e "$(colored "31" "[ CRITICAL ERROR ]") ${1^} logfile does not exist in ${LOGS_PATH}. Terminating."
+		kill -s TERM ${PARENT_PID}
+		sleep 10 # wait additional time to hide output of script (trap will kill all child processes)
+	else
+		echo "${1^^} logfile: ${logfile}"
+	fi
+}
+
+function CHECK_LOGFILE() {
+	tail -n0 -f ${logfile} |
+	while read -t 300 line; do
+		grep 'ERROR' <<< ${line}
+		if echo $line | grep -q 'Started in'; then
+			ps -fu ${USER} | grep 'tail -n0 -f '${logfile} | grep -v grep | awk '{print $2}' | xargs kill -9 # kill tail process after component is started
+			echo -e "Successfully started: $(colored "34" "${1}") on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+			ps -fu ${USER} | grep java | grep $2 | grep -v grep > ~/bin/PID_files/${2}.pid
+			break
+		fi
+	done
+}
+
+# logic was spuned off to be able to manage it independently
+function LOGIC_RESTART() {
+	if [[ ${SERVER_NAME} =~ ^(all|logic)$ ]]; then 
+		echo -e "\nStarting $(colored "35" "logic") on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+		cd ${SERVERS_PATH}/logic/bin
+		export JBOSS_HOME=''
+		nohup ./run.sh -c d10000conf_logic > /dev/null 2>&1 &
+		sleep 20 # give extra time to generate logfile by application
+
+		# %T@ gives the modification time like a unix timestamp, 'cut -f2 -d" "' cuts away the first field (the timestamp); for a huge tree, it might be hard for sort to keep everything in memory
+		logfile=$(find ${LOGS_PATH} -name "crm_logic_server_*.log" -type f -printf '%T@ %p\n' | sort -n | tail -1 | cut -f2- -d" ")
+		FIND_LOG logic
+		CHECK_LOGFILE 'logic' 'd10000conf_logic'
+	fi
+}
+
+function PROCESS_RESTART() {
+	echo -e "\nStarting $(colored "35" "${2}") on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	cd ${SERVERS_PATH}/$3/bin
+	export JBOSS_HOME=''
+	nohup ./run.sh $1 > /dev/null 2>&1 &
+	sleep 20 # give extra time to generate logfile by application
+
+	if [ "$2" = 'esb11k' ]; then
+		echo -e "Successfully started: $(colored "34" "esb11000") on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	else
+		logfile=$(find ${LOGS_PATH} -name "crm_$2_server_*.log" -type f -printf '%T@ %p\n' | sort -n | tail -1 | cut -f2- -d" ")
+		FIND_LOG ${2}
+		CHECK_LOGFILE "$2" "$4"
+	fi
+}
+
+function PRESENTATION_RESTART() {
+	echo -e "\nStarting $(colored "35" "presentation") on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	rm -f ${LOCK_PRESENTATION_FILE}
+	cd ${SERVERS_PATH}/presentation/bin/
+	nohup ./tomcat.sh -c d10000conf_presentation > /dev/null 2>&1 &
+
+	function waitForPresentation() {
+		hour="$(date +"%H")"
+		minute="$(date +"%M")"
+		time_md=$((60*${hour#0}+${minute#0}))
+
+		sleep 20 # give extra time to generate logfile by application
+		logfile=$(find ${LOGS_PATH} -name "$1_*.log" -type f -printf '%T@ %p\n' | sort -n | tail -1 | cut -f2- -d" ")
+		FIND_LOG presentation
+
+		counter=1
+		while [ 1 ]; do
+			logfile_new=$(find ${LOGS_PATH} -name "$1_*.log" -type f -printf '%T@ %p\n' | sort -n | tail -1 | cut -f2- -d" ")
+
+			if [ "${logfile}" != "${logfile_new}" ]; then
+				logfile=${logfile_new}
+				echo "New logfile has been found: ${logfile##*/}"
+			fi
+
+			echo "[$counter out of 25] Waiting for $2 on ${IP_ADDRESS} ( ${HOSTNAME} ) -" $((60*$counter)) "sec"
+			log_hour=`cat ${logfile} | grep "Server startup in" | awk 'BEGIN{FS = " "}; { print $2 }' | awk -v time_md=$time_md 'BEGIN{FS = ":"} { if(60*$1+$2 > time_md-1) { print "presentation started at " $1 ":" $2 } }'`
+
+			if [[ $log_hour =~ .*presentation.*started.* ]]; then
+				dev_mode=`cat ${logfile} | grep "developermode:" | awk 'BEGIN{FS = " "}; { print $2 $5 }' | awk -v time_md=$time_md 'BEGIN{FS = ":"} { if(60*$1+$2 > time_md-1) { print $1 ":" $2 " :"  $3 "=" $4 } }'`
+				[[ $dev_mode =~ .*developermode=true.* ]] && echo -e "$(colored "33" "[ WARNING ]") ${2^} started in developer mode"
+				ps -fu ${USER} | grep java | grep $2 | grep -v grep > ~/bin/PID_files/$3              
+				break
+			fi    
+
+			if [ $counter -eq 25 ];	then
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") ${2^} did not start in required 25min ( the running process is left in background )"
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") Component logfiles: ${logfile}"
+				exit 1
+			fi
+
+			counter=$(($counter+1))
+			sleep 60
+		done
+
+		sleep 30 # wait for web service (avoid accidentally wrong responses from web service)
+		echo `date` >> ${LOCK_PRESENTATION_FILE}
+		echo -e "Successfully started: $(colored "34" "${2}") on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+	}
+
+	# starting embedded presentation for version 7.3 (version should be declared in PARALLEL_PRESENTATIONS)
+	if [[ `grep ^PARALLEL_PRESENTATIONS ~/bin/servers.arr | grep "${ENV_NAME}"` ]]; then
+		echo -e "\nStarting embedded presentation on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+		nohup ./tomcat.sh -c embedded > /dev/null 2>&1 &
+		waitForPresentation "crm_presentation_embedded_server" "embedded presentation" "embedded.pid" &
+	fi
+	waitForPresentation "crm_presentation_server" "presentation" "d10000conf_presentation.pid" &
+}
+
+#--------------------------------------------------------------------#
+#------------------------- TESTING FUNCTION -------------------------#
+#--------------------------------------------------------------------#
+
+function HTTP_CRM_TESTING() {
+	# acceleration of the status display by getting rid of redundant components
+	function logic_wget() { LANGUAGE="C" wget --timeout=10 --tries=3 --spider http://${IP_ADDRESS}:`grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $2}'`/jmx-console -O - 2>&1; }
+	function presentation_wget() { LANGUAGE="C" wget --timeout=10 --tries=3 --spider http://${IP_ADDRESS}:${PRESENTATION_HTTP_PORT} -O - 2>&1; }
+	function batch_logic_wget() { LANGUAGE="C" wget --timeout=10 --tries=3 --spider http://${IP_ADDRESS}:`grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $3}'`/jmx-console -O - 2>&1; }
+	function bpm_wget() { LANGUAGE="C" wget --timeout=10 --tries=3 --spider http://${IP_ADDRESS}:`grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $4}'`/jmx-console -O - 2>&1; }
+	function esb10k_wget() { LANGUAGE="C" wget --timeout=10 --tries=3 --spider http://${IP_ADDRESS}:`grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $5}'`/jmx-console -O - 2>&1; }
+	function esb11k_wget() { LANGUAGE="C" wget --timeout=10 --tries=3 --spider http://${IP_ADDRESS}:`grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $6}'`/jmx-console -O - 2>&1; }
+
+	if [[ ${SERVER_NAME} =~ ^(all|logic|presentation)$ ]] || [[ `grep "^PARALLEL_PRESENTATIONS\|^HA_RELEASE" ~/bin/servers.arr | grep "${ENV_NAME}"` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]; then
+		echo -e "\n$(colored "34" "Testing CRM modules via HTTP protocol on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+
+		[[ ${SERVER_NAME} =~ ^(all|logic|presentation)$ ]] && PROCESS_TESTING "$(logic_wget)" "LOGIC" `grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $2}'` "d10000conf_logic"
+		if [[ `grep ^HA_RELEASE ~/bin/servers.arr | grep "${ENV_NAME}"` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]; then # checking if release is equal HA to check components status on additional nodes
+			[[ ${SERVER_NAME} =~ ^(all|batch)$ ]] && PROCESS_TESTING "$(batch_logic_wget)" "BATCH LOGIC" `grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $3}'` "d10000batch_conf_logic"
+			[[ ${SERVER_NAME} =~ ^(all|batch|bpm)$ ]] && PROCESS_TESTING "$(bpm_wget)" "BPM" `grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $4}'` "d10000conf_bpm"
+			if [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]; then # condition to check components status on main node
+				[[ ${SERVER_NAME} =~ ^(all|batch|bpm|esb10k)$ ]] && PROCESS_TESTING "$(esb10k_wget)" "ESB 10000" `grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $5}'` "d10000conf_esb"
+				([[ `grep ^ESB_11000 ~/bin/servers.arr | grep "${ENV_NAME}"` ]] && [[ ${SERVER_NAME} =~ ^(all|esb11k)$ ]]) && \
+				PROCESS_TESTING "$(esb11k_wget)" "ESB 11000" `grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $6}'` "d11000conf_esb"
+			fi
+		fi
+		[[ ${SERVER_NAME} =~ ^(all|presentation)$ ]] && \
+		PRESENTATION_TESTING "$(presentation_wget)" ${PRESENTATION_HTTP_PORT} ${PRESENTATION_HTTPS_PORT} "PRESENTATION" "d10000conf_presentation"
+		if [[ `grep ^PARALLEL_PRESENTATIONS ~/bin/servers.arr | grep "${ENV_NAME}"` ]]; then # checking if release is equal version 7.3 to start embedded presentation
+			presentation_embedded_wget=$(wget --timeout=10 --spider http://${IP_ADDRESS}:`grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $7}'` -O - 2>&1)
+			[[ ${SERVER_NAME} =~ ^(all|presentation)$ ]] && \
+			PRESENTATION_TESTING "$presentation_embedded_wget" `grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $7}'` `grep ^CRM_PORTS ~/bin/servers.arr | awk '{print $8}'` "PRESENTATION EMBEDDED" "embedded"
+		fi
+	fi
+
+    # check if CRM has fully started
+    [[ ${PID_ERROR} -eq 1 ]] && { echo -e "$(colored "31" "[ CRITICAL ERROR ]") Control files should be veryfied. Please contact ITOPS department."; }
+    if [[ ${ERROR} -eq 1 ]]; then
+    	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") CRM components have not fully started. Please contact ITOPS department in urgent cases."
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Application logfiles: ${SHOW_DEFAULT_PATH}/logs/`date +%Y`/`date +%m`/`date +%d`"
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Components configuration: ${SHOW_DEFAULT_PATH}/servers/<component>/server/<module>/conf"
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Correctness of application configuration and databases availability should be veryfied."
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Broken application modules should be restarted by accessing mubemanage script."
+    	[[ ${NOERROR} != '--noerror' ]] && exit 1 || :
+    fi
+}
+
+function get_process_parameters() {
+	stime=`ps -p $1 -o lstart= | awk '{print $2 $3}'` # start day
+	upwork=`ps -p $1 -o lstart= | awk '{print $4}'` # start time
+	cpu=`ps -p $1 -o %cpu= | awk '{print $1}'` # cpu load
+	memory=`ps -p $1 -o %mem= | awk '{print $1}'` # memory load
+	echo -e "PID: [ $(colored "35" "$(printf "%5d" $APP_PID)") ] Stime: [ $(colored "36" "$stime") $(colored "36" "$upwork") ]" \
+	"CPU: [ $(colored "31" "$(printf "%4s" $cpu)") ] PMEM: [ $(colored "33" "$(printf "%4s" $memory)") ] $component $(colored "32" "is responding") on port $port"
+}
+
+function PRESENTATION_TESTING() {
+	local component=$4; port=$2
+	if [[ $1 =~ .*awaiting.response\.\.\..200.OK.* ]] || [[ `LANGUAGE="C" wget --timeout=10 --tries=3 --spider https://${IP_ADDRESS}:$3 -O - 2>&1` =~ .*awaiting.response\.\.\..200.OK.* ]]; then
+		APP_PID=`cat ~/bin/PID_files/${5}.pid 2>/dev/null | awk '{print $2}'`
+		([[ -z ${APP_PID} ]] || [[ ! ${APP_PID} =~ ^[0-9]+$ ]]) && { echo -e "$(colored "31" "[ WARNING ]") $4 PID is not written properly to ~/bin/PID_files/${5}.pid"; PID_ERROR=1; } || get_process_parameters ${APP_PID}
+	else
+		CHECK_PORT_OPEN='' # reset to original state
+		[[ `which netstat` ]] && CHECK_PORT_OPEN=$(netstat -naltp 2>/dev/null | grep "$2\|$3" | awk '$(NF-1) == "LISTEN" {print $NF}' | sed 's|[^0-9]*||g' | sort -u | sed 's|\n|,|g' | head -n1)
+		[[ ${CHECK_PORT_OPEN} ]] && \
+		echo -e "$(colored "31" "[ WARNING ]") $4 component is $(colored "33" "not responding") neither on port "$2" nor "$3" despite running ${CHECK_PORT_OPEN} process" || \
+		echo -e "$(colored "31" "[ WARNING ]") $4 component is $(colored "33" "not responding") neither on port "$2" nor "$3
+		ERROR=1
+	fi
+}
+
+function PROCESS_TESTING() {
+	local component=$2; port=$3
+	if [[ $1 =~ .*awaiting.response\.\.\..401.Unauthorized.* ]]; then
+		APP_PID=`cat ~/bin/PID_files/${4}.pid 2>/dev/null | awk '{print $2}'`
+		([[ -z ${APP_PID} ]] || [[ ! ${APP_PID} =~ ^[0-9]+$ ]]) && { echo -e "$(colored "31" "[ WARNING ]") $2 PID is not written properly to ~/bin/PID_files/${4}.pid"; PID_ERROR=1; } || get_process_parameters ${APP_PID}
+	else
+		CHECK_PORT_OPEN='' # reset to original state
+		[[ `which netstat` ]] && CHECK_PORT_OPEN=$(netstat -naltp 2>/dev/null | grep "$3" | awk '$(NF-1) == "LISTEN" {print $NF}' | sed 's|[^0-9]*||g' | sort -u | sed 's|\n|,|g' | head -n1)
+		[[ ${CHECK_PORT_OPEN} ]] && \
+		echo -e "$(colored "31" "[ WARNING ]") $2 component is $(colored "33" "not responding") on port "$3" despite running ${CHECK_PORT_OPEN} process" || \
+		echo -e "$(colored "31" "[ WARNING ]") $2 component is $(colored "33" "not responding") on port $3"
+		ERROR=1
+	fi
+}
+
+#--------------------------------------------------------------------#
+#--------------------------- REMOTE HOSTS ---------------------------#
+#--------------------------------------------------------------------#
+
+function REMOTE_CRM() {
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		# perform parallel operations (added additional switch 'current' to enable showing status on nodes different than main)
+		[[ "${SERV[0]}" == "${SHOW_ENV_NAME}" ]] &&  [[ "${SERV[1]}" == "CRM" ]] && [[ "${SERV[3]}" != "1" ]] && \
+		ssh -qo BatchMode=yes ${SERV[2]} "bash -l -c 'crm_manage $1 $2 $ENV_NAME current'" 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED." &
+	done
+	wait
+}
+
+function REMOTE_SEQUENTIAL() {
+	# used for status (main reason - spilling statements)
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		if [ "${SERV[0]}" = "${SHOW_ENV_NAME}" -a "${SERV[1]}" = "CRM" -a "${SERV[3]}" != "1" ]; then
+			ssh -qo BatchMode=yes ${SERV[2]} "bash -l -c 'crm_manage $1 $2 $ENV_NAME current'" 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED."
+			PIPE_EXIT_STATUS=${PIPESTATUS[0]}
+			[[ $2 == 'status' ]] && [[ ${PIPE_EXIT_STATUS} -eq 1 ]] && ERROR=1
+		fi
+	done
+}
+
+#--------------------------------------------------------------------#
+#------------------------- COPYING SCRIPTS --------------------------#
+#--------------------------------------------------------------------#
+
+function MD5_SUM() {
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		# update scripts for current environment, declared environment type and for nodes that are different than set: current IP and current user
+		if [[ "${SERV[0]}" = "${SHOW_ENV_NAME}" && "${SERV[1]}" == 'CRM' && "${SERV[6]} ${SERV[4]}" != "${IP_ADDRESS} ${CURRENT_USER}" ]]; then
+			SSH_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${SERV[4]}@${SERV[2]} echo confirmed 2>&1)
+			if [[ $SSH_STATUS == 'confirmed' ]]; then
+				SUM=(`ssh -qo BatchMode=yes ${SERV[4]}@${SERV[2]} md5sum $(echo ${SCRIPT_DIR} | sed "s|${CURRENT_USER}|${SERV[4]}|g") 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED."`)
+				if [[ ${md5_local[0]} != ${SUM[0]} ]]; then
+					RESULT=$(scp -pq ${SCRIPT_DIR} ${SERV[4]}@${SERV[2]}:$(echo ${SCRIPT_DIR} | sed "s|${CURRENT_USER}|${SERV[4]}|g") 2>&1); CODE=$?
+					if [ ${CODE} -ne 0 ]; then
+						echo -e "$(colored "31" "[ CRITICAL ERROR ]") Script `basename "$0"` encountered errors during scripts update (please contact ITOPS department)"
+						echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error line: ${RESULT}"
+						echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error code: ${CODE}"
+						exit 1
+					fi
+				fi
+			else
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") Script `basename "$0"` encountered errors during execution (please contact ITOPS department)"
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") SSH connection to remote host: ${SERV[4]}@${SERV[2]} is denied"
+				exit 1
+			fi
+		fi
+	done
+}
+
+#--------------------------------------------------------------------#
+#----------------------- WAIT FOR PRESENTATION ----------------------#
+#--------------------------------------------------------------------#
+
+# waiting until presentation lock file will be generated, while is used because of possibility to break function
+# logic and presentation are separated because of launching on all nodes
+# checking which version of CRM is present - 7.3 release needs 2 presentations running in parallel
+function WAIT_FOR_PRESENTATION() {
+	[[ `grep ^PARALLEL_PRESENTATIONS ~/bin/servers.arr | grep "${ENV_NAME}"` ]] && LOCK_LINES=2 || LOCK_LINES=1
+	while [ 1 ]; do
+		if [[ ${SERVER_NAME} =~ ^(all|logic|presentation)$ ]]; then
+			while [ -f ${LOCK_PRESENTATION_FILE} ] && [ `grep -c ^ ${LOCK_PRESENTATION_FILE}` == ${LOCK_LINES} ]; do
+				break 2
+			done
+			sleep 15
+		fi
+	done
+}
+
+#--------------------------------------------------------------------#
+#-------------------------- PRECONDITIONS ---------------------------#
+#--------------------------------------------------------------------#
+
+function check_processes_number() {
+	for PID_FILE_CHECK in `find ~/bin/PID_files -type f \( -iname "d1?000*.pid" -o -iname "embedded.pid" \)`; do
+		if [ `awk '{print $2}' ${PID_FILE_CHECK} | wc -l` -ne 1 ]; then
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") Number of working processes does not agree with requirements (one process instance must run at the same time)."
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") Please check working PIDs and application logfiles. Wrongly opened instances should be turned off manually (${PID_FILE_CHECK} file)."
+			exit 1
+		fi
+	done
+}
+
+# check if user links to proper environment
+if [ ${SHOW_ENV_NAME,,} != ${ENV_NAME,,} ]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong environment was definied during script induction."
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Current environment: ${SHOW_ENV_NAME^^}. Definied environment: ${ENV_NAME^^}.\n"
+	exit 1
+fi
+
+find ${SERVERS_PATH}/*/bin -name "*.sh" -type f -exec chmod 764 {} \; # add permissions to all '*.sh' files in '*/bin' directory (for each component)
+
+# check if another process is running in parallel
+if [[ "${JOB}" =~ ^(stop|restart|start)$ ]]; then
+	mkdir -p ~/bin/PID_files # create required folders
+	([[ -f "$PID_FILE" ]] && [[ `cat $PID_FILE` ]]) && echo -e "$(colored "31" "[ WARNING ]") Another process with `cat $PID_FILE` PID is already written to $(basename $0).pid lockfile on ${IP_ADDRESS} ( ${HOSTNAME} )"
+	for CHECK_ANOTHER_PID in $(pidof -x $(basename $0)); do
+		if [ ${CHECK_ANOTHER_PID} != ${PARENT_PID} ]; then
+			echo -e "$(colored "31" "[ WARNING ]") Terminating already running process with ${CHECK_ANOTHER_PID} PID on ${IP_ADDRESS} ( ${HOSTNAME} )"
+			kill -9 ${CHECK_ANOTHER_PID} &>/dev/null # kill silently
+		fi
+	done
+	echo ${PARENT_PID} > "${PID_FILE}"
+fi
+
+# update scripts on all nodes - comparing to main node
+if [[ "${JOB}" =~ ^(stop|restart|start|status)$ ]] && [[ -z $(echo "$@" | grep -w 'current') ]]; then
+	if [ "${IP_ADDRESS}" = "${LOCAL_HOST}" ] && [ ${REMOTE_HOST} != '0' ]; then
+		md5_local=`md5sum ${SCRIPT_DIR} | awk '{ print $1 }'`
+		MD5_SUM
+	fi
+fi
+
+# check if something did not go wrong (restart executes on remote host script two times)
+# important only when starting applications and checking status (stop is turning off all applications)
+# validation: compare working processes with PIDs written to semaphore files (only if any processes are working)
+if [[ "${JOB}" =~ ^(start|status)$ ]]; then
+	for CRM_COMPONENT in d10000conf_logic d10000batch_conf_logic d10000conf_bpm d10000conf_esb d11000conf_esb d10000conf_presentation embedded; do
+		CHECK_WORKING_PROCESSES=$(ps -fu ${USER} | grep java | grep -w ${CRM_COMPONENT} | grep -v grep | awk '{print $2}')
+		if [[ -f ~/bin/PID_files/${CRM_COMPONENT}.pid ]] || [[ ${CHECK_WORKING_PROCESSES} ]]; then
+			APP_ERROR=0 # reset values to initial state
+			if [[ ${CHECK_WORKING_PROCESSES} ]]; then
+				PROCESS_PID=$(cat ~/bin/PID_files/${CRM_COMPONENT}.pid | awk '{print $2}')
+				[[ ! ${CHECK_WORKING_PROCESSES} -eq ${PROCESS_PID} ]] && APP_ERROR=1
+			fi &>/dev/null
+
+			if [[ ${APP_ERROR} -eq 1 ]]; then
+				echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Some of working processes were not written to semaphore files: ~/bin/PID_files/${CRM_COMPONENT}.pid"
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") Currently working process's PID: ${CHECK_WORKING_PROCESSES}. Written PID: `[[ ${PROCESS_PID} ]] && echo ${PROCESS_PID} || echo 'empty_string'`"
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") Remaining processes should be stopped manually or script should be launched with 'restart' option"
+				exit 1
+			fi
+		fi
+	done
+	check_processes_number
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTIONS CALLS --------------------------#
+#--------------------------------------------------------------------#
+
+if [[ "${JOB}" =~ ^(restart|stop)$ ]]; then
+	KILLING
+	([[ "${IP_ADDRESS}" == "${LOCAL_HOST}" ]] && [[ ${REMOTE_HOST} != '0' ]] && [[ "${CUR_NAME}" == "" ]]) && REMOTE_CRM "${SERVER_NAME}" "stop"
+fi
+
+# rememeber to wait until request is finished, when given is '&' parameter
+if [[ "${JOB}" =~ ^(restart|start)$ ]]; then
+	if ([[ "${IP_ADDRESS}" == "${LOCAL_HOST}" ]] && ([[ "${CUR_NAME}" == 'current' ]] || [[ "${REMOTE_HOST}" == '0' ]])) || [[ "${IP_ADDRESS}" != "${LOCAL_HOST}" ]]; then
+		# if there is one main node or we force start only on main node with proper switch
+		if [[ "${SERVER_NAME}" =~ ^(all|logic|presentation)$ ]]; then # non HA environments (start logic and presentation)
+			[[ "${SERVER_NAME}" =~ ^(all|logic)$ ]] && LOGIC_RESTART
+			RESTARTING
+			[[ "${SERVER_NAME}" =~ ^(all|presentation)$ ]] && WAIT_FOR_PRESENTATION
+		elif [[ `grep ^HA_RELEASE ~/bin/servers.arr | grep "${ENV_NAME}"` ]] || [[ "${IP_ADDRESS}" == "${LOCAL_HOST}" ]]; then # HA and one node environments
+			RESTARTING
+			# exclude esb components on nodes different than main (HA systems)
+			! ([[ `grep ^HA_RELEASE ~/bin/servers.arr | grep "${ENV_NAME}"` ]] && [[ "${SERVER_NAME}" =~ ^(esb10k|esb11k)$ ]] && [[ "${IP_ADDRESS}" != "${LOCAL_HOST}" ]]) && HTTP_CRM_TESTING
+		fi
+	elif [[ "${REMOTE_HOST}" != '0' ]]; then
+		if [[ "${IP_ADDRESS}" == "${LOCAL_HOST}" ]]; then # check hostname if equal main node value
+			if [[ ${SERVER_NAME} = 'all' ]] && [[ `grep ^HA_RELEASE ~/bin/servers.arr | grep "${ENV_NAME}"` ]]; then # only for HA environments (run all components, omitting esb on additional nodes)
+				REMOTE_CRM "logic" "start" & # parallelism in the sequence operations
+				LOGIC_RESTART &
+				wait
+				[[ ${SERVER_NAME} == 'logic' ]] && REMOTE_CRM "presentation" "start" & # avoid double launch of logic and allow to run presentation
+				[[ ${SERVER_NAME} != 'logic' ]] && REMOTE_CRM "${SERVER_NAME}" "start" & # allow to run other components
+				RESTARTING &
+				wait
+				WAIT_FOR_PRESENTATION
+			elif [[ ${SERVER_NAME} =~ ^(all|logic)$ ]]; then
+				REMOTE_CRM "logic" "start" &
+				LOGIC_RESTART &
+				wait
+				REMOTE_CRM "presentation" "start" & # presentation is launched remotely with unequivocal argument
+				# restart application directly ('RESTARTING' function is launching restart only, when script was inducted with 'all' and 'presentation' arguments)
+				[[ ${SERVER_NAME} != 'all' ]] && PRESENTATION_RESTART || RESTARTING & # function returns exit code which is treated in primary condition as extended pipe (condition - execution - execution)
+				wait
+				WAIT_FOR_PRESENTATION
+			elif [[ ${SERVER_NAME} == 'presentation' ]]; then
+				REMOTE_CRM "presentation" "start" &
+				PRESENTATION_RESTART &
+				wait
+				WAIT_FOR_PRESENTATION
+			elif [[ ${SERVER_NAME} =~ ^(batch|bpm)$ ]]; then # these components are not dependent of logic
+				[[ `grep ^HA_RELEASE ~/bin/servers.arr | grep "${ENV_NAME}"` ]] && REMOTE_CRM "${SERVER_NAME}" "start" &
+				RESTARTING &
+				wait
+				[[ `grep ^HA_RELEASE ~/bin/servers.arr | grep "${ENV_NAME}"` ]] && REMOTE_SEQUENTIAL "${SERVER_NAME}" "status"
+				HTTP_CRM_TESTING
+			else # case for restarting esb components
+				RESTARTING
+				HTTP_CRM_TESTING
+			fi
+		fi
+	fi
+fi
+
+# avoidance of disorder in display messages - only status job (rest in WAIT_FOR_PRESENTATION function) or status for component independent of presentation lock
+if [[ "${JOB}" =~ ^(restart|start|status)$ ]]; then
+	if [ "${IP_ADDRESS}" == "${LOCAL_HOST}" ] && [ ${REMOTE_HOST} != '0' ] && [ "${CUR_NAME}" != "current" ]; then
+		# order is important (${IP_ADDRESS} stores status execution of remote hosts, which return error signal)
+		REMOTE_SEQUENTIAL "${SERVER_NAME}" "status"
+		HTTP_CRM_TESTING
+	else
+		HTTP_CRM_TESTING
+	fi
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- POST EXECUTION ---------------------------#
+#--------------------------------------------------------------------#
+
+check_processes_number # check number of working instances of particular process
+rm -f -- "${PID_FILE}" # remove semaphore file

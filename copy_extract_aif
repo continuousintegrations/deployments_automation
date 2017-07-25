@@ -1,0 +1,121 @@
+#!/bin/bash -
+# build_date=11.07.2017
+# application should be declared in '${ENV}_APPS_CLUSTERING' key, if clustering is mendatory
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+# softlinks validation (function is sourced from common file) - first argument: deployment softlink name, second argument: primary softlink, third argument: application type
+trap 'component_validation deployment_AIF_current current AIF "$@"' EXIT
+
+STEP_NAME="AIF_copyextract"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep -w "^${ENV}" ${SERVERS_ARR_FILE} | grep AIF | head -n1 | awk '{ print $6 }'`
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+AIF_VERSION=$(basename `find ${VERSION_DIR} -maxdepth 1 -name "aif-*-assembly-*.tar.gz" -printf '%T+ %p\n' | tail -n1 | awk '{print $2}'`) # component full name (get the newest from package)
+AIF_HASH=$(echo ${AIF_VERSION} | sed "s|^aif-.*-assembly-||" | sed "s|.tar.gz$||") # only version
+
+AIF_BUILDS="${RHOME}/versions"
+AIF_DIRECTORY=${AIF_BUILDS}/${AIF_VERSION%.tar.gz} # destination directory of installed binaries
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function check_version() {
+	VERSION_EXISTS='' # reset to original state (variable is overwritten during loop)
+
+    fLog "Checking if AIF ${AIF_HASH} version is installed on ${HOST} environment"
+    CHECK_VERSION=`tar -tf ${VERSION_DIR}/${AIF_VERSION} | cut -d'/' -f1 | uniq | head -n1` # name of delivered AIF version
+    CHECK_CURRENT=$(run_remote_command ${HOST} -n "[[ -L "${RHOME}/current" ]] && [[ -e "${RHOME}/current" ]]"); CODE_EXPORT=$? # check if softlink exists and is not broken (export flag for further actions)
+    if [ ${CODE_EXPORT} -eq 0 ]; then
+    	RESULT=$(run_remote_command ${HOST} -n "[[ \`find ${AIF_BUILDS} -type d -name \"${CHECK_VERSION}\"\` ]]")
+        if [ $? -ne 0 ]; then 
+        	fLog "$(colored "32" "[ INFORMATION ]") Version doesn't exist on ${HOST} environment. Processing component deployment."
+        else
+        	fLog -n "$(colored "31" "[ WARNING ]") Version is present on target ${HOST} environment. Aborting component deployment."
+        	VERSION_EXISTS="true"
+
+        	# copy 'current' softlink for the purpose of changes propagation (properties_config.xml is modified if HOT_DEPLOY is enabled)
+        	[[ ${@: -1} == '--silent' ]] && run_remote_command ${HOST} "cp -P ${SERV[5]}/current ${SERV[5]}/deployment_AIF_current" || :
+        fi
+    else
+    	fLog -n "$(colored "31" "[ WARNING ]") AIF is not installed on ${HOST} environment. Processing component deployment."
+    fi
+
+    if [[ ${VERSION_EXISTS} != 'true' ]]; then
+    	if [[ ${@: -1} == '--silent' ]]; then
+    		fLog "$(colored "34" "[ INFORMATION ]") Detected additional 'silent' switch. Processing component deployment on running system."      
+    		run_remote_command ${HOST} "rm -rf ${RHOME}/deployment_AIF_current" # remove softlink
+    		run_remote_command ${HOST} "ln -s ${AIF_DIRECTORY} ${RHOME}/deployment_AIF_current" # create needed softlink
+        else
+        	echo -e "$(colored "34" "[ INFORMATION ]") There is no additional switch in script induction. Running default component deployment."
+        fi
+    fi
+}
+
+function copy_to_server() {
+	run_remote_command ${HOST} "mkdir -p ${RHOME}/{versions,zip_files}" # create required directories
+	fLog "$(colored "34" "[ INFORMATION ]") Copying ${AIF_HASH} AIF binaries"
+	fLog "Destination directory: ${RHOME}/zip_files"
+    rsync -vrltD --stats --human-readable -e ssh ${VERSION_DIR}/${AIF_VERSION} ${USER}@${HOST}:${RHOME}/zip_files # used rsync instead of scp, beacuase of partial output and better handling for large files
+    CODE=$?; check_errors
+    fLog "$(colored "32" "[ INFORMATION ]") AIF binaries copied successfully"
+}
+
+function update_binaries() {
+	if [[ ${@: -1} != '--silent' ]] && [[ ${CODE_EXPORT} -eq 0 ]]; then
+		fLog "Updating softlink"
+		run_remote_command ${HOST} "ln -sfn ${AIF_DIRECTORY} ${RHOME}/current" # update softlink
+	elif [[ ${@: -1} != '--silent' ]]; then
+		fLog "Removing broken softlink and previously extracted version"
+        [[ -z ${AIF_DIRECTORY} ]] && stop_deployment "Aborting deployment, because of lacking \${AIF_DIRECTORY} variable" || :
+        run_remote_command ${HOST} "rm -rf ${RHOME}/current ${AIF_DIRECTORY}" # remove broken softlink and currently extracted version
+        run_remote_command ${HOST} "ln -s ${AIF_DIRECTORY} ${RHOME}/current" # create needed softlink
+    fi
+
+    fLog "$(colored "34" "[ INFORMATION ]") AIF binaries deployment"
+    run_remote_command ${HOST} "tar -zxf ${RHOME}/zip_files/${AIF_VERSION} -C ${AIF_BUILDS}"
+
+    fLog "$(colored "32" "[ INFORMATION ]") AIF ${AIF_HASH} version was installed properly on ${ENV} environment"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+	SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "AIF" ]]; then
+    	HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+    	check_version "$@"
+    	if [[ ${VERSION_EXISTS} != "true" ]]; then
+    		copy_to_server
+    		update_binaries "$@"
+    	fi
+        [[ ! `grep ^"${ENV}_APPS_CLUSTERING" ${SERVERS_ARR_FILE} | grep -w AIF` ]] && break # break loop after first node if environment is not dedicated for HA
+    fi
+done
+
+source ${BIN_PATH}/common_after

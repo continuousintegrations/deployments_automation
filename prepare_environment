@@ -1,0 +1,395 @@
+#!/bin/bash -
+# environment prepare tool by adam.chalat@comarch.com
+# script supports taks: elasticsearch, java, liquibase, rabbitmq, update-scripts, zookeeper
+# management scripts which are deployed are encrypted with password: 'comadmin' and for root management: 'rootpass'
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="19.07.2017r."
+SCRIPT_VERSION="0.1.27"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+
+#--------------------------------------------------------------------#
+#-------------------------- HELP FUNCTION ---------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 2 ]; then
+	echo -e "\nEnvironment prepare tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	echo -e "Available parameter [task]: elasticsearch, java, liquibase, rabbitmq, update-scripts, zookeeper\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [environment] [task]")\n"
+	stop_deployment "Incorrect induction of $(basename $0) script"
+fi
+
+#--------------------------------------------------------------------#
+#---------------------- VARIABLES AND PATHS -------------------------#
+#--------------------------------------------------------------------#
+
+MANAGEMENT_PASS='comadmin'
+ROOT_PASS='rootpass'
+
+#--------------------------------------------------------------------#
+#------------------------- PREREQUISITES ----------------------------#
+#--------------------------------------------------------------------#
+
+function check_components() {
+	if [[ -z `find ${SERVER_COMPONENTS} -name ${1}` ]]; then
+		fLog "$(colored "31" "[ WARNING ]") Component does not exist in ${SERVER_COMPONENTS} repository. Exiting."
+		stop_deployment "Component does not exist in ${SERVER_COMPONENTS} repository"
+	fi
+}
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+##### java #####
+function java_generate_paths() {
+	check_components "jdk-7u*.tar.gz"
+	check_components "jdk-8u*.tar.gz"
+	JAVA_DIR=${RHOME%/*}/java/instances
+	JAVA_JDK_17=`basename \`find ${SERVER_COMPONENTS} -name jdk-7u*.tar.gz\``
+	JAVA_JDK_18=`basename \`find ${SERVER_COMPONENTS} -name jdk-8u*.tar.gz\``
+}
+
+function java_copy_to_server() {
+    run_remote_command ${SERV[2]} "mkdir -p ${JAVA_DIR}" # create required directories
+
+    fLog "Java JDK binaries copy"
+    fLog "Files: ${JAVA_JDK_17} ${JAVA_JDK_18}"
+    fLog "Destination directory: ${JAVA_DIR}"
+    RESULT=$(scp -pq ${SERVER_COMPONENTS}/${JAVA_JDK_17} ${SERVER_COMPONENTS}/${JAVA_JDK_18} ${USER}@${HOST}:${JAVA_DIR} 2>&1)
+    CODE=$?; check_errors
+    fLog "JAVA binaries copied successfully"
+}
+
+function java_extract_on_server() {
+	fLog "Extracting Java JDKs"
+	for JAVA in ${JAVA_JDK_17} ${JAVA_JDK_18}; do
+		RESULT=$(run_remote_command ${SERV[2]} "[ -d ${JAVA_DIR}/\`tar -tf ${JAVA_DIR}/${JAVA} | sed \"s|\\/.*||g\" | head -n1\` ]"); CODE=$?
+		if [[ ${CODE} -eq 0 ]]; then
+			fLog "$(colored "31" "[ WARNING ]") Java ${JAVA} binaries already exist in ${JAVA_DIR} directory. Skipping extract process."
+		else
+			fLog "$(colored "32" "[ INFORMATION ]") Extracting Java ${JAVA} binaries to ${JAVA_DIR} directory"
+			RESULT=$(run_remote_command ${SERV[2]} "tar -zxf ${JAVA_DIR}/${JAVA} -C ${JAVA_DIR}/")
+			CODE=$?; check_errors
+			fLog "Java binaries extracted successfully"
+
+			fLog "Creating symbolic link to Java JDK"
+			run_remote_command ${SERV[2]} "rm -rf ${RHOME%/*}/java/\`tar -tf ${JAVA_DIR}/${JAVA} | sed \"s|\\/.*||g\" | head -n1 | cut -c1-6\`"
+			run_remote_command ${SERV[2]} "ln -s ${JAVA_DIR}/\`tar -tf ${JAVA_DIR}/${JAVA} | head -n1\` ${RHOME%/*}/java/\`tar -tf ${JAVA_DIR}/${JAVA} | sed \"s|\\/.*||g\" | head -n1 | cut -c1-6\`"
+			fLog "Symbolic link created successfully"
+		fi
+	done
+
+	run_remote_command ${SERV[2]} "rm -rf ${RHOME%/*}/java/default"
+	run_remote_command ${SERV[2]} "ln -s ${RHOME%/*}/java/jdk1.7 ${RHOME%/*}/java/default"
+
+	fLog "Removing Java JDK binaries"
+	run_remote_command ${SERV[2]} "rm -f ${JAVA_DIR}/${JAVA_JDK_17} ${JAVA_DIR}/${JAVA_JDK_18}"
+	fLog "Binaries removed successfully"
+}
+
+##### rabbitmq #####
+function rabbitmq_generate_paths() {
+	RABBIT_DIR=${RHOME}/rabbitmq
+	RESULT=$(run_remote_command ${SERV[2]} "[[ \$(ls ${RABBIT_DIR}) ]]" 2>/dev/null)
+	if [[ $? -eq 0 ]]; then
+		INSTALL='FALSE'
+		fLog "$(colored "31" "[ WARNING ]") Skipping RabbitMQ deployment on ${USER}@${HOST} (directory ${RABBIT_DIR} is not empty)"
+	else
+		INSTALL='TRUE'
+		check_components "rabbitmq*.tar.gz"
+	fi
+}
+
+function rabbitmq_copy_to_server() {
+	RABBITMQ_BINARIES=`basename \`find ${SERVER_COMPONENTS} -name rabbitmq*.tar.gz\``
+    run_remote_command ${SERV[2]} "mkdir -p ${RABBIT_DIR}" # create required directories
+
+    fLog "RabbitMQ binaries copy"
+    fLog "Files: ${RABBITMQ_BINARIES}"
+    fLog "Destination directory: ${RABBIT_DIR}"
+    RESULT=$(scp -pq ${SERVER_COMPONENTS}/${RABBITMQ_BINARIES} ${USER}@${HOST}:${RABBIT_DIR} 2>&1)
+    CODE=$?; check_errors
+    fLog "RabbitMQ binaries copied successfully"
+}
+
+function rabbitmq_extract_on_server() {
+	fLog "Extracting RabbitMQ binaries"
+	run_remote_command ${SERV[2]} "tar -xf ${RABBIT_DIR}/${RABBITMQ_BINARIES} -C ${RABBIT_DIR}/"
+	fLog "RabbitMQ extracted successfully"
+
+	fLog "Installing RabbitMQ server"
+	run_remote_command ${SERV[2]} "sed -i \"s|<hostname>|\`hostname -s\`|g\" ${RABBIT_DIR}/rabbitmq-env.sh"
+	run_remote_command ${SERV[2]} "sed -i \"s|<replace>|${RHOME}|g\" ${RABBIT_DIR}/rabbitmq-env.sh"
+	run_remote_command ${SERV[2]} "${RABBIT_DIR}/rabbitmq.sh install"
+	run_remote_command ${SERV[2]} "${RABBIT_DIR}/rabbitmq.sh start" # starting RabbitMQ to allow the establishment of users
+
+	fLog "Creating users: bpm crmcqrs esb logic logicbatch presentation iaa"
+	run_remote_command ${SERV[2]} "sed -i.bak "'"1 i\set -f"'" ${RABBIT_DIR}/rabbitmq.sh" # create backup and disable wildcards expanding
+	for user in bpm crmcqrs esb logic logicbatch presentation iaa; do
+		run_remote_command ${SERV[2]} "${RABBIT_DIR}/rabbitmq.sh ctl add_user ${user} ${user}"
+		run_remote_command ${SERV[2]} "${RABBIT_DIR}/rabbitmq.sh ctl set_permissions ${user} \".*\" \".*\" \".*\"" # permissions (.* or ^$)
+	done
+	run_remote_command ${SERV[2]} "rm ${RABBIT_DIR}/rabbitmq.sh; mv ${RABBIT_DIR}/rabbitmq.sh.bak ${RABBIT_DIR}/rabbitmq.sh"
+	fLog "$(colored "32" "[ INFORMATION ]") RabbitMQ deployment on ${USER}@${HOST} completed successfully"
+
+	([[ -z ${RABBIT_DIR} ]] || [[ -z ${RABBITMQ_BINARIES} ]]) && stop_deployment "Aborting deployment, because of lacking \${RABBIT_DIR} variable" || :
+	run_remote_command ${SERV[2]} "rm -rf ${RABBIT_DIR}/${RABBITMQ_BINARIES}" # remove unnecessary
+}
+
+##### zookeeper #####
+function zookeeper_generate_paths() {
+	ZOOKEEPER_DIR=${SERV[5]}/config_management
+	RESULT=$(run_remote_command ${SERV[2]} "[[ \$(ls ${ZOOKEEPER_DIR}) ]]" 2>/dev/null)
+	if [[ $? -eq 0 ]]; then
+		INSTALL='FALSE'
+		fLog "$(colored "31" "[ WARNING ]") Skipping ZooKeeper deployment on ${USER}@${HOST} (directory ${ZOOKEEPER_DIR} is not empty)"
+	else
+		INSTALL='TRUE'
+		check_components "ZK_server*.tar.gz"
+		check_components "ZK_client*.tar.gz"
+	fi
+}
+
+function zookeeper_copy_to_server() {
+	copy_manage_tool ${TOSERVERS_PATH}/zk_manage # copy required configuration files (components are started after deploy)
+	[[ ${CRM_MAIN} == 'true' ]] && ZOOKEEPER_BINARIES=`basename \`find ${SERVER_COMPONENTS} -name ZK_server*.tar.gz\`` || ZOOKEEPER_BINARIES=`basename \`find ${SERVER_COMPONENTS} -name ZK_client*.tar.gz\``
+    run_remote_command ${SERV[2]} "mkdir -p ${ZOOKEEPER_DIR}" # create required directories
+
+    fLog "ZooKeeper binaries copy"
+    fLog "Files: ${ZOOKEEPER_BINARIES}"
+    fLog "Destination directory: ${ZOOKEEPER_DIR}"
+    RESULT=$(scp -pq ${SERVER_COMPONENTS}/${ZOOKEEPER_BINARIES} ${USER}@${SERV[2]}:${ZOOKEEPER_DIR} 2>&1)
+    CODE=$?; check_errors
+    fLog "ZooKeeper binaries copied successfully"
+}
+
+function zookeeper_extract_on_server() {
+	fLog "Extracting ZooKeeper binaries"
+	run_remote_command ${SERV[2]} "tar -zxf ${ZOOKEEPER_DIR}/$ZOOKEEPER_BINARIES -C ${ZOOKEEPER_DIR}"
+	run_remote_command ${SERV[2]} "rm ${ZOOKEEPER_DIR}/$ZOOKEEPER_BINARIES"
+
+	fLog "Configuring znode"
+	MAIN_ZNODE=$(grep ^${VERSION} $SERVERS_ARR_FILE | awk -v var=crm '$5 == var {print}' | awk '$4 == /1/ {print $7}')
+	run_remote_command ${SERV[2]} "sed -i \"s|{hostname}|${MAIN_ZNODE}|g\" ${ZOOKEEPER_DIR}/zk-client/conf/client.properties"
+	run_remote_command ${SERV[2]} "sed -i \"s|{node_type}|\`hostname\`_\${USER^^}|g\" ${ZOOKEEPER_DIR}/zk-client/conf/client.properties"
+	if [[ ${CRM_MAIN} == 'true' ]]; then
+		run_remote_command ${SERV[2]} "sed -i \"s|{DIR}|${RHOME}|g\" ${ZOOKEEPER_DIR}/zk-server-1/conf/zoo.cfg"
+
+		COPY_SERVER_CONF=$(scp -pq ${LHOME}/${PROJECT}/bin/environments_configuration/{common/properties_config.xml,${VERSION}/{values.properties,clients_config.xml}} ${USER}@${SERV[2]}:${RHOME}/config_management/data/files 2>&1)
+		if [[ $? -ne 0 ]]; then
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Errors during transferring ZooKeeper's configuration files to ${RHOME}/config_management/data/files location"
+			fLog "$(colored "31" "[ CRITICAL ERROR ]") Required files: ${LHOME}/${PROJECT}/bin/environments_configuration/${VERSION}/{common/properties_config.xml,values.properties,clients_config.xml}"
+		fi
+	fi
+	fLog "ZooKeeper extracted and configured successfully"
+	run_remote_command ${SERV[2]} "zk_manage all start ${VERSION}" # start components after successful deploy
+}
+
+##### liquibases #####
+function liquibase_generate_paths() {
+	check_components "liquibase_${SERV[1],,}*.tar.gz"
+}
+
+function liquibase_copy_to_server() {
+	LIQUIBASE_BINARIES=`basename \`find ${SERVER_COMPONENTS} -name "*liquibase_${SERV[1],,}*.tar.gz"\``
+    run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/liquibase" # create required directories
+
+    fLog "Liquibase binaries copy"
+    fLog "Files: ${LIQUIBASE_BINARIES}"
+    fLog "Destination directory: ${RHOME}"
+    RESULT=$(scp -pq ${SERVER_COMPONENTS}/${LIQUIBASE_BINARIES} ${USER}@${SERV[2]}:${RHOME} 2>&1)
+    CODE=$?; check_errors
+    fLog "Liquibase binaries copied successfully"
+}
+
+function liquibase_extract_on_server() {
+	RESULT=$(run_remote_command ${SERV[2]} "[ -d ${RHOME_DIR}/liquibase ]")
+	if [ $? != 0 ]; then
+		fLog "Extracting liquibase binaries"
+		run_remote_command ${SERV[2]} "tar -zxf ${RHOME}/${LIQUIBASE_BINARIES} -C ${RHOME}/liquibase"
+		([[ -z ${RHOME} ]] || [[ -z ${LIQUIBASE_BINARIES} ]]) && stop_deployment "Aborting deployment, because of lacking \${LIQUIBASE_BINARIES} variable" || :
+		run_remote_command ${SERV[2]} "rm -rf ${RHOME}/${LIQUIBASE_BINARIES}"
+		run_remote_command ${SERV[2]} "chmod 764 ${RHOME}/liquibase/bin/ant"
+
+        RESULT=$(scp -pq ${LHOME}/${PROJECT}/bin/environments_configuration/${VERSION}/liquibase.properties ${USER}@${SERV[2]}:${RHOME}/liquibase/conf 2>&1) # copy configuration file after extracting archive
+        CODE=$?; check_errors
+
+        fLog "Liquibase extracted successfully"
+    else
+    	fLog -n "Liquibase directory already exists. Skipping."
+    fi
+}
+
+##### elasticsearch #####
+function elasticsearch_generate_paths() {
+	check_components "elasticsearch*.tar"
+	ELASTICSEARCH_DIR=${RHOME}/servers/ES
+    ELASTICSEARCH_MAIN=${ELASTICSEARCH_DIR}/elasticsearch_${SERV[3]} # parameter from servers.arr: ${SERV[3]} determines directory
+}
+
+function elasticsearch_copy_to_server() {
+	# systems starting from 7.3 are using elasticsearch in revision 2.4.5
+	[[ `grep ^SYSTEM_VERSION ${SERVERS_ARR_FILE} | awk '{print $2}'` -ge 73 ]] && \
+	ELASTICSEARCH_BINARIES=`basename \`find ${SERVER_COMPONENTS} -name elasticsearch_2*.tar.gz\`` || \
+	ELASTICSEARCH_BINARIES=`basename \`find ${SERVER_COMPONENTS} -name elasticsearch_1*.tar.gz\``
+
+	run_remote_command ${SERV[2]} "mkdir -p ${ELASTICSEARCH_MAIN}" # create required directories
+
+	fLog "ElasticSearch binaries copy"
+	fLog "Files: ${ELASTICSEARCH_BINARIES}"
+	fLog "Destination directory: ${ELASTICSEARCH_DIR}"
+	RESULT=$(scp -pq ${SERVER_COMPONENTS}/${ELASTICSEARCH_BINARIES} ${USER}@${SERV[2]}:${ELASTICSEARCH_DIR} 2>&1)
+	CODE=$?; check_errors
+	fLog "ElasticSearch binaries copied successfully"
+}
+
+function elasticsearch_extract_on_server() {
+	fLog "Extracting ElasticSearch binaries"
+	run_remote_command ${SERV[2]} "tar -zxf ${ELASTICSEARCH_DIR}/$ELASTICSEARCH_BINARIES -C ${ELASTICSEARCH_MAIN}/"
+	([[ -z ${ELASTICSEARCH_DIR} ]] || [[ -z ${ELASTICSEARCH_BINARIES} ]]) && stop_deployment "Aborting deployment, because of lacking \${ELASTICSEARCH_BINARIES} variable" || :
+	run_remote_command ${SERV[2]} "rm -rf ${ELASTICSEARCH_DIR}/${ELASTICSEARCH_BINARIES}"
+	fLog "ElasticSearch extracted successfully"
+}
+
+##### update scripts #####
+function copy_manage_tool() {
+	# remove casuing errors regular files and mubemanage lockfiles, create required directories and prevent displaying 'last login' prompt
+	run_remote_command ${SERV[2]} "mkdir -p ~/bin/log; touch ~/.hushlogin; find ~ ~/bin/log -maxdepth 1 -type f \( -iname \"bin\" -o -iname \"*_mubemanage.lockfile\" \) -exec rm -f {} +"
+
+	fLog "\nServer configuration files copy: location finder tool, servers array and mubemanage"
+	fLog "Destination directory: ${BIN_DIR}"
+	RESULT=$(scp -pq ${TOSERVERS_PATH}/location_finder ${SERVERS_ARR_FILE} ${BIN_PATH}/toservers/mubemanage ${LHOME}/${PROJECT}/bin/environments_configuration/${VERSION}/values.properties \
+	${SERVER_COMPONENTS}/Scripts/.decode.enc ${USER}@${SERV[2]}:${BIN_DIR} 2>&1)
+	CODE=$?; check_errors
+	fLog "Server configuration files: location finder tool, servers array and mubemanage copied successfully"
+
+	if [[ `grep ^${VERSION}_CONFIGURATION ${SERVERS_ARR_FILE} | awk '{print $4}'` == 'SSH_UPDATE' ]]; then
+		fLog "\nSSH configuration files copy: authorized_keys and known_hosts"
+		fLog "Destination directory: ~/.ssh"
+		RESULT=$(scp -pq ${LHOME}/${PROJECT}/bin/environments_configuration/${VERSION}/ssh_keys/{authorized_keys,known_hosts} ${USER}@${SERV[2]}:~/.ssh 2>&1)
+		CODE=$?; check_errors
+		fLog "SSH configuration files, authorized_keys and known_hosts, copied successfully"
+	else
+		fLog -n "$(colored "31" "[ WARNING ]") Skipping SSH configuration files update"
+	fi
+
+	fLog "\nApplication management tools copy"
+	fLog "Destination directory: ${BIN_DIR}"
+	RESULT=$(scp -pq ${LHOME}/development-activities/server_startup/applications_startup ${LHOME}/development-activities/data_retention/data_retention $@ ${USER}@${SERV[2]}:${BIN_DIR} 2>&1)
+	CODE=$?; check_errors
+	fLog "Application manage tools copied successfully"
+
+	if [[ `grep ^${VERSION}_CONFIGURATION ${SERVERS_ARR_FILE} | awk '{print $2}'` == 'CHECK_TERMINAL_CONF' ]]; then
+		fLog "\nTerminal configuration files copy: .bash_profile, .bashrc, .run_ssh_agent and .profile"
+		fLog "Destination directory: ~"
+		RESULT=$(scp -pq ${LHOME}/${PROJECT}/bin/environments_configuration/{.bash_profile,.bashrc,.profile} ${USER}@${SERV[2]}:~ 2>&1); CODE=$?; check_errors
+		RESULT=$(scp -pq ${LHOME}/development-activities/ssh_agent/.run_ssh_agent ${USER}@${SERV[2]}:~/bin 2>&1); CODE=$?; check_errors
+		fLog "Terminal configuration files updated successfully"
+	else
+		fLog -n "$(colored "31" "[ WARNING ]") Skipping terminal configuration update and validation of .bash_profile"
+	fi
+	run_remote_command ${SERV[2]} "find ${BIN_DIR} -type f -print | xargs chmod 764" &>/dev/null # add execute permissions
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+echo ${MANAGEMENT_PASS} > ${SERVER_COMPONENTS}/Scripts/.decode # create required pass storage file
+
+if [[ ${ENV} == 'update-scripts' ]]; then
+	[[ `grep ^PROTECTED_ENVIRONMENTS ${SERVERS_ARR_FILE} | grep ${VERSION}` ]] && \
+	find ${BIN_PATH}/toservers/ -name "*_manage" -exec sh -c 'cat {} | openssl aes-128-cbc -a -salt -k '"'${MANAGEMENT_PASS}'"' > '"'${SERVER_COMPONENTS}'"'/Scripts/`basename {}`.enc' \;
+	cat ${SERVER_COMPONENTS}/Scripts/.decode | openssl aes-128-cbc -a -salt -k ${ROOT_PASS} > ${SERVER_COMPONENTS}/Scripts/.decode.enc # create encrypted file with passphrase for applications_startup script
+
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER); USER="${SERV[4]}"
+		if [[ "${SERV[0]}" = "${VERSION}" ]] && [[ "${SERV[1]}" =~ ^(CRM|CPM|DPS|TUM|BPC|AIF|QUORUM)$ ]]; then
+			if [[ "${SERV[1]}" = "CRM" ]]; then
+				[[ `grep ^PROTECTED_ENVIRONMENTS ${SERVERS_ARR_FILE} | grep ${VERSION}` ]] && \
+				copy_manage_tool ${SERVER_COMPONENTS}/Scripts/{crm_manage.enc,rmq_manage.enc,jr_manage.enc,zk_manage.enc} ${TOSERVERS_PATH}/{upgrade_crm_db,DataUpgrade_Prerequisites.zip} || \
+				copy_manage_tool ${TOSERVERS_PATH}/{crm_manage,rmq_manage,jr_manage,zk_manage,upgrade_crm_db,DataUpgrade_Prerequisites.zip}
+			elif [[ "${SERV[1]}" =~ ^(CPM|QUORUM)$ ]]; then
+				[[ `grep ^PROTECTED_ENVIRONMENTS ${SERVERS_ARR_FILE} | grep ${VERSION}` ]] && \
+				copy_manage_tool ${SERVER_COMPONENTS}/Scripts/{bss_manage.enc,rmq_manage.enc,es_manage.enc,zk_manage.enc} ${TOSERVERS_PATH}/{upgrade_bs_db,bss_binaries,bss_binaries,BSS_Upgrade_TytanSessions.zip} || \
+				copy_manage_tool ${TOSERVERS_PATH}/{bss_manage,rmq_manage,es_manage,zk_manage,upgrade_bs_db,bss_binaries,bss_binaries,BSS_Upgrade_TytanSessions.zip}
+			elif [[ "${SERV[1]}" = "DPS" ]]; then
+				[[ `grep ^PROTECTED_ENVIRONMENTS ${SERVERS_ARR_FILE} | grep ${VERSION}` ]] && \
+				copy_manage_tool ${SERVER_COMPONENTS}/Scripts/dps_manage.enc || \
+				copy_manage_tool ${TOSERVERS_PATH}/dps_manage
+			elif [[ "${SERV[1]}" = "TUM" ]]; then
+				[[ `grep ^PROTECTED_ENVIRONMENTS ${SERVERS_ARR_FILE} | grep ${VERSION}` ]] && \
+				copy_manage_tool ${SERVER_COMPONENTS}/Scripts/{tum_manage.enc,zk_manage.enc} || \
+				copy_manage_tool ${TOSERVERS_PATH}/{tum_manage,zk_manage}
+			elif [[ "${SERV[1]}" = "BPC" ]]; then
+				[[ `grep ^PROTECTED_ENVIRONMENTS ${SERVERS_ARR_FILE} | grep ${VERSION}` ]] && \
+				copy_manage_tool ${SERVER_COMPONENTS}/Scripts/{bpc_manage.enc,zk_manage.enc} || \
+				copy_manage_tool ${TOSERVERS_PATH}/{bpc_manage,zk_manage}
+			elif [[ "${SERV[1]}" = "AIF" ]]; then
+				[[ `grep ^PROTECTED_ENVIRONMENTS ${SERVERS_ARR_FILE} | grep ${VERSION}` ]] && \
+				copy_manage_tool ${SERVER_COMPONENTS}/Scripts/{aif_manage.enc,zk_manage.enc} || \
+				copy_manage_tool ${TOSERVERS_PATH}/{aif_manage,zk_manage}
+			fi
+		fi
+	done
+fi
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+	SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${VERSION}" ]]; then # replace ${ENV} with ${VERSION} to input only one argument for script
+    	HOST="${SERV[2]}"; USER="${SERV[4]}"; RHOME="${SERV[5]}"
+    	if [[ ${ENV} == 'java' ]] && [[ "${SERV[1]}" =~ ^(CPM|CRM|BPC|TUM|BPC)$ ]]; then
+    		JAVA_GROUP=$(run_remote_command ${SERV[2]} "stat -Lc \"%U %G %A\" /opt/java | awk "'"{print \$2}"'"" | sed 1,4d)
+    		VERIFICATION_STATUS=$(run_remote_command ${SERV[2]} "grep ${JAVA_GROUP} /etc/group | grep ${SERV[4]}")
+    		if [[ $? -ne 0 ]]; then
+    			echo -e "$(colored "31" "[ CRITICAL ERROR ]") User ${SERV[4]} does not have required permissions to /opt/java folder"
+    			echo -e "$(colored "31" "[ CRITICAL ERROR ]") All users should be added to bulk 'bss' group ('groupadd <groupname>' and next 'usedadd -G <groupname> <username>')"
+    			exit 1
+    		fi
+
+            java_generate_paths # overwrite paths for each node (avoiding errors if directories are different)
+            java_copy_to_server
+            java_extract_on_server
+        elif [[ ${ENV} == 'rabbitmq' ]] && [[ "${SERV[1]}" =~ ^(CPM|CRM)$ && "${SERV[3]}" =~ ^(1|2)$ ]]; then
+        	if ([[ ! `grep ^"${VERSION}_APPS_CLUSTERING" ${SERVERS_ARR_FILE} | grep -w 'RMQ'` ]] && [[ "${SERV[1]}" == 'CPM' && "${SERV[3]}" -eq 1 ]]) || \
+        		[[ `grep ^"${VERSION}_APPS_CLUSTERING" ${SERVERS_ARR_FILE} | grep -w 'RMQ'` ]]; then
+
+        		rabbitmq_generate_paths
+        		[[ ${INSTALL} == 'TRUE' ]] && { rabbitmq_copy_to_server; rabbitmq_extract_on_server; }
+        	else
+        		echo -e "$(colored "33" "[ INFORMATION ]") Application has not been configured for high availability on ${SERV[4]}@${SERV[6]}"
+        	fi
+        elif [[ ${ENV} == 'zookeeper' ]] && [[ "${SERV[1]}" =~ ^(CPM|CRM|BPC|TUM|AIF)$ ]]; then
+            [[ "${SERV[3]}" = "1" && "${SERV[1]}" = "CRM" ]] && CRM_MAIN='true' || CRM_MAIN='false' # copy ZK server or ZK client
+            zookeeper_generate_paths
+            [[ ${INSTALL} == 'TRUE' ]] && { zookeeper_copy_to_server; zookeeper_extract_on_server; }
+        elif [[ ${ENV} == 'liquibase' ]] && [[ "${SERV[1]}" =~ ^(CPM|CRM)$ && "${SERV[3]}" = "1" ]]; then
+        	liquibase_generate_paths
+        	liquibase_copy_to_server
+        	liquibase_extract_on_server
+        elif [[ ${ENV} == 'elasticsearch' ]] && [[ "${SERV[1]}" = "CPM" ]]; then
+        	elasticsearch_generate_paths
+        	elasticsearch_copy_to_server
+        	elasticsearch_extract_on_server
+        fi
+    fi
+done

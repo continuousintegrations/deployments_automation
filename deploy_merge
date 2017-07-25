@@ -1,0 +1,94 @@
+#!/bin/bash -
+# build_date=04.07.2017
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="Deploy_merge"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+#--------------------------------------------------------------------#
+#---------------------------- FUNCTIONS -----------------------------#
+#--------------------------------------------------------------------#
+
+function bpc_custom_task() {
+	CHECK_CURRENT_LOADER=$(run_remote_command ${HOST} -n "[[ -L "${RHOME}/bpc-loader/deployment_BPC_current" ]] && [[ -e "${RHOME}/bpc-loader/deployment_BPC_current" ]]"); CODE_EXPORT_1=$? # check if softlink exists and is not broken
+	CHECK_CURRENT_RESTAPI=$(run_remote_command ${HOST} -n "[[ -L "${RHOME}/bpc-rest-api/deployment_BPC_current" ]] && [[ -e "${RHOME}/bpc-rest-api/deployment_BPC_current" ]]"); CODE_EXPORT_2=$?
+	if [ ${CODE_EXPORT_1} -eq 0 ] && [ ${CODE_EXPORT_2} -eq 0 ]; then
+		fLog "Updating softlinks for BPC loader and restAPI"
+		run_remote_command ${SERV[2]} "rm -f ${RHOME}/bpc-loader/current; mv ${RHOME}/bpc-loader/deployment_BPC_current ${RHOME}/bpc-loader/current" # backup of BPC is supported externally
+		run_remote_command ${SERV[2]} "rm -f ${RHOME}/bpc-rest-api/current; mv ${RHOME}/bpc-rest-api/deployment_BPC_current ${RHOME}/bpc-rest-api/current"
+	fi
+}
+
+function cpm_custom_task() {
+	CHECK_CURRENT=$(run_remote_command ${HOST} -n "[[ -L "${RHOME}/servers/launcher/deployment_current" ]] && [[ -e "${RHOME}/servers/launcher/deployment_current" ]]"); CODE_EXPORT=$?
+	if [ ${CODE_EXPORT} -eq 0 ]; then
+		fLog "Updating softlinks for BSS launcher"
+		run_remote_command ${SERV[2]} "rm -f ${RHOME}/servers/launcher/current; mv ${RHOME}/servers/launcher/deployment_current ${RHOME}/servers/launcher/current" # backup of BSS is supported externally
+	fi
+}
+
+function crm_custom_task() {
+	CHECK_CURRENT=$(run_remote_command ${HOST} -n "[[ -d "${RHOME}/deployment_servers" ]]"); CODE_EXPORT=$?
+	if [ ${CODE_EXPORT} -eq 0 ]; then
+		fLog "Binaries substitution for CRM"
+		run_remote_command ${SERV[2]} "mv ${RHOME}/servers ${RHOME}/deployment_backup 2>/dev/null; mv ${RHOME}/deployment_servers ${RHOME}/servers" # binaries substitution
+
+		if [[ "${SERV[3]}" = "1" ]]; then
+			fLog "$(colored "32" "[ INFORMATION ]") Restoring environment configuration" # restore backuped files to original state and move to ZK location
+			run_remote_command ${HOST} "cp ${RHOME}/Temp_Install/${VERSION}/common/properties_config.xml.bak ${RHOME}/config_management/data/files/properties_config.xml"
+		fi
+	fi
+}
+
+function tum_custom_task() {
+	CHECK_CURRENT=$(run_remote_command ${HOST} -n "[[ -L "${RHOME}/deployment_TUM_current" ]] && [[ -e "${RHOME}/deployment_TUM_current" ]]"); CODE_EXPORT=$?
+	if [ ${CODE_EXPORT} -eq 0 ]; then
+		fLog "Updating softlinks for TUM restAPI"
+		run_remote_command ${SERV[2]} "rm -f ${RHOME}/tum-restapi; mv ${RHOME}/deployment_TUM_current ${RHOME}/tum-restapi" # backup of TUM is supported externally
+	fi
+}
+
+function aif_custom_task() {
+	CHECK_CURRENT=$(run_remote_command ${HOST} -n "[[ -L "${RHOME}/deployment_AIF_current" ]] && [[ -e "${RHOME}/deployment_AIF_current" ]]"); CODE_EXPORT=$?
+	if [ ${CODE_EXPORT} -eq 0 ]; then
+		fLog "Updating softlinks for AIF"
+		run_remote_command ${SERV[2]} "rm -f ${RHOME}/current; mv ${RHOME}/deployment_AIF_current ${RHOME}/current" # backup of AIF is supported externally
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTIONS CALL ---------------------------#
+#--------------------------------------------------------------------#
+
+if [[ `grep ^${ENV}_CONFIGURATION ${SERVERS_ARR_FILE} | awk '{print $3}'` == 'HOT_DEPLOY' ]]; then
+	fLog "$(colored "32" "[ INFORMATION ]") Detected components deployment in 'silent' mode. Executing custom tasks."
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		HOST="${SERV[2]}"; USER="${SERV[4]}"; RHOME="${SERV[5]}"
+
+		if [[ "${SERV[0]}" = "${ENV}" ]]; then
+			for ENV_TYPE in CRM CPM TUM BPC AIF; do
+				[[ "${SERV[1]}" == "${ENV_TYPE}" ]] && ${ENV_TYPE,,}_custom_task
+			done
+		fi
+	done
+fi
+
+source ${BIN_PATH}/common_after

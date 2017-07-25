@@ -1,0 +1,70 @@
+#!/bin/bash -
+# build_date=04.07.2017
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="BSS_Tytan_Sessions"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep CPM | head -n1 | awk '{ print $6 }'`
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+CPM_DB_PATH=${RHOME}/liquibase
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function copy_to_server() {
+    run_remote_command ${HOST} "mkdir -p ${CPM_DB_PATH}/utilities/Logs" # create required directories
+    
+    fLog "Copying BSS Upgrade changeset - Remove Tytan Sessions"
+    fLog "Destination directory: ${CPM_DB_PATH}/utilities"
+    RESULT=$(scp -pq ${TOSERVERS_PATH}/BSS_Upgrade_TytanSessions.zip ${USER}@${HOST}:${CPM_DB_PATH}/utilities 2>&1)
+    CODE=$?; check_errors
+    fLog "$(colored "32" "[ INFORMATION ]") BSS Upgrade changeset copied successfully"
+}
+
+function remove_tytan_sessions() {
+    fLog "Unpacking BSS liquibase changeset"
+    run_remote_command ${HOST} "unzip -o ${CPM_DB_PATH}/utilities/BSS_Upgrade_TytanSessions.zip -d ${CPM_DB_PATH}/utilities/"
+    
+    fLog "Executing changeset - remove tytan sessions"
+    run_remote_command ${HOST} "chmod 764 ${CPM_DB_PATH}/utilities/tytan_sessions.sh" # adding execute permissions for script
+    run_remote_command ${HOST} "${CPM_DB_PATH}/utilities/tytan_sessions.sh BSS_Upgrade_TytanSessions"
+    fLog "$(colored "32" "[ INFORMATION ]") Tytan sessions removed successfully"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+    SERV=($SERVER)
+    if [[ "${SERV[0]}" = "$ENV" && "${SERV[1]}" = "CPM" && "${SERV[3]}" = "1" ]]; then # execute only on main CPM node
+        HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+        copy_to_server
+        remove_tytan_sessions
+    fi
+done
+
+source ${BIN_PATH}/common_after

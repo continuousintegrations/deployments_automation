@@ -1,0 +1,148 @@
+#!/bin/bash -
+# build_date=11.07.2017
+# deploy both components (loader and restapi) if one of them is not installed or broken on target environment
+# application should be declared in '${ENV}_APPS_CLUSTERING' key, if clustering is mendatory
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+# softlinks validation (function is sourced from common file) - first argument: deployment softlink name, second argument: primary softlink, third argument: application type
+trap 'component_validation bpc-loader/deployment_BPC_current bpc-loader/current BPC "$@"; component_validation bpc-rest-api/deployment_BPC_current bpc-rest-api/current BPC "$@"' EXIT
+
+STEP_NAME="BPC_copyextract"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep BPC | head -n1 | awk '{ print $6 }'`
+
+#--------------------------------------------------------------------#
+#---------------------- PATHS AND VARIABLES -------------------------#
+#--------------------------------------------------------------------#
+
+PATH_TO_LOADER_DIR="${RHOME}/bpc-loader"
+PATH_TO_API_DIR="${RHOME}/bpc-rest-api"
+
+BPC_LOADER=$(basename `find ${VERSION_DIR} -maxdepth 1 -name "bpc-loader*.tar.gz" -printf '%T+ %p\n' | tail -n1 | awk '{print $2}'`)
+BPC_REST_API=$(basename `find ${VERSION_DIR} -maxdepth 1 -name "bpc-rest-api*.zip" -printf '%T+ %p\n' | tail -n1 | awk '{print $2}'`)
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function check_version() {
+    VERSION_EXISTS_REST_API=''; VERSION_EXISTS_LOADER='' # reset to original state (variable is overwritten during loop)
+    function check_component_existence() {
+    	CHECK_STATUS=$1; shift # first argument is last command status check, others are representing script induction parameters
+        if [ ${CHECK_STATUS} -eq 0 ]; then
+        	BPC_INSTALLED=`run_remote_command ${HOST} "ls -t ${COMPONENT_ARR[2]}/builds | head -1 | sed 's#.*/##'" | tail -n1` # currently installed version on environment
+        	if [[ ${COMPONENT_ARR[4]} != ${BPC_INSTALLED} ]]; then
+        		fLog "$(colored "32" "[ INFORMATION ]") ${COMPONENT_ARR[3]} version doesn't exist on ${HOST} environment. Processing component deployment."
+        	else
+        		fLog -n "$(colored "31" "[ WARNING ]") ${COMPONENT_ARR[3]} version is present on target ${HOST} environment. Aborting component deployment."
+        		eval VERSION_EXISTS_${COMPONENT}="true"
+
+                # copy 'current' softlink for the purpose of changes propagation (properties_config.xml is modified if HOT_DEPLOY is enabled)
+                [[ ${@: -1} == '--silent' ]] && run_remote_command ${HOST} "cp -P ${COMPONENT_ARR[2]}/current ${COMPONENT_ARR[2]}/deployment_BPC_current" || :
+            fi
+        else
+        	fLog -n "$(colored "32" "[ INFORMATION ]") ${COMPONENT_ARR[3]} is not installed on ${HOST} environment. Processing component deployment."
+        	fLog "$(colored "31" "[ WARNING ]") No data will be imported from previously installed version."
+        fi
+    }
+
+    if [[ ${BPC_LOADER} ]] && [[ ${BPC_REST_API} ]]; then
+    	for COMPONENT in LOADER REST_API; do
+    		[ ${COMPONENT} == REST_API ] && declare -a COMPONENT_ARR=("${BPC_REST_API}" "${BPC_REST_API%.zip}" "${PATH_TO_API_DIR}" "BPC RestAPI" "`zipinfo -1 ${VERSION_DIR}/${BPC_REST_API} | head -n1 | cut -d"/" -f1`")
+    		[ ${COMPONENT} == LOADER ] && declare -a COMPONENT_ARR=("${BPC_LOADER}" "${BPC_LOADER%.tar.gz}" "${PATH_TO_LOADER_DIR}" "BPC Loader" "`tar -tf ${VERSION_DIR}/${BPC_LOADER} | head -n1 | cut -d"/" -f1`")
+
+    		fLog -n "Checking if ${COMPONENT_ARR[3]} version: ${COMPONENT_ARR[1]} is installed on ${HOST} environment"
+            # check if softlink exists and is not broken (export flag for further actions)
+    		CHECK_CURRENT=$(run_remote_command ${HOST} -n "[[ -L "${COMPONENT_ARR[2]}/current" ]] && [[ -e "${COMPONENT_ARR[2]}/current" ]]"); eval CODE_EXPORT_${COMPONENT}=$?
+    		eval VARIABLE='$'CODE_EXPORT_${COMPONENT} # create variable to distinguish each case in loop
+    		check_component_existence ${VARIABLE} "$@"
+    	done
+    else
+    	fLog "$(colored "31" "[ WARNING ]") Delivered package is not complete - missing BPC Loader or BPC RestAPI component"
+    	stop_deployment "Delivered package is not complete - missing BPC Loader or BPC RestAPI component"
+    fi
+
+    if [[ ${VERSION_EXISTS_REST_API} != "true" ]] || [[ ${VERSION_EXISTS_LOADER} != "true" ]]; then
+        if [[ ${@: -1} == '--silent' ]]; then
+            fLog "$(colored "32" "[ INFORMATION ]") Detected additional 'silent' switch. Processing component deployment on running system."        
+            SOFTLINK_NAME='deployment_BPC_current'
+        else
+            echo -e "$(colored "32" "[ INFORMATION ]") There is no additional switch in script induction. Running default component deployment."
+            SOFTLINK_NAME='current'
+        fi
+    fi
+}
+
+function copy_to_server() {
+	run_remote_command ${HOST} "mkdir -p ${PATH_TO_LOADER_DIR} ${PATH_TO_API_DIR} ${RHOME}/bpc_binaries ${PATH_TO_LOADER_DIR}/builds" # create required directories
+	fLog "$(colored "34" "[ INFORMATION ]") Copying BPC binaries"
+	fLog "BPC Loader version: $(echo ${BPC_LOADER} | sed "s|^bpc-loader-||" | sed "s|.tar.gz$||")"
+	fLog "BPC RestAPI version: $(echo ${BPC_REST_API} | sed "s|^bpc-rest-api-||" | sed "s|.zip$||")"
+	fLog "Destination directory: ${RHOME}"
+    rsync -vrltD --stats --human-readable -e ssh ${VERSION_DIR}/{${BPC_LOADER},${BPC_REST_API}} ${USER}@${HOST}:${RHOME}/bpc_binaries # used rsync instead of scp, beacuase of partial output and better handling for large files
+	CODE=$?; check_errors
+	fLog "$(colored "32" "[ INFORMATION ]") BPC binaries copied successfully"
+}
+
+function extract_on_server() {
+	fLog "$(colored "34" "[ INFORMATION ]") BPC binaries deployment"
+	run_remote_command ${HOST} "tar -zxf ${RHOME}/bpc_binaries/${BPC_LOADER} -C ${PATH_TO_LOADER_DIR}/builds"
+	run_remote_command ${HOST} "unzip -qo ${RHOME}/bpc_binaries/${BPC_REST_API} -d ${PATH_TO_API_DIR}/builds"
+
+	for CHECK_CODE in CODE_LOADER CODE_API; do
+        # in first column: path to currently extracted binaries, in second: path to softlink, in third: status of symlink (variable CODE_EXPORT_${COMPONENT})
+		[ ${CHECK_CODE} == CODE_LOADER ] && declare -a COMPONENT_ARR=("${PATH_TO_LOADER_DIR}/builds/${BPC_LOADER%.tar.gz}" "${PATH_TO_LOADER_DIR}/${SOFTLINK_NAME}" "${CODE_EXPORT_LOADER}")
+		[ ${CHECK_CODE} == CODE_API ] && declare -a COMPONENT_ARR=("${PATH_TO_API_DIR}/builds/${BPC_REST_API%.zip}" "${PATH_TO_API_DIR}/${SOFTLINK_NAME}" "${CODE_EXPORT_REST_API}")
+
+		if [ ${COMPONENT_ARR[2]} -eq 0 ]; then
+			fLog "Move link '${SOFTLINK_NAME}' to ${COMPONENT_ARR[0]}"
+			run_remote_command ${HOST} "ln -sfn ${COMPONENT_ARR[0]} ${COMPONENT_ARR[1]}"
+		else
+			fLog -n "Removing broken softlink and previously extracted version"
+            [[ -z ${COMPONENT_ARR[1]} ]] && stop_deployment "Aborting deployment, because of lacking \${COMPONENT_ARR[1]} variable" || :
+        	run_remote_command ${HOST} "rm -rf ${COMPONENT_ARR[1]}" # remove broken softlink and currently extracted version
+        	run_remote_command ${HOST} "ln -s ${COMPONENT_ARR[0]} ${COMPONENT_ARR[1]}" # create needed softlink
+        fi
+
+        run_remote_command ${HOST} "find ${COMPONENT_ARR[1]}/bin -maxdepth 1 -type f -exec chmod 764 {} \;" # add executable states for control scripts
+    done
+    fLog "$(colored "32" "[ INFORMATION ]") BPC upgrade performed successfully"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+	SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "BPC" ]]; then # execute only on main BPC node
+    	HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+    	check_version "$@" # arguments transmission to functions
+    	if [[ ${VERSION_EXISTS_REST_API} != "true" ]] || [[ ${VERSION_EXISTS_LOADER} != "true" ]]; then
+    		copy_to_server
+    		extract_on_server
+    	fi
+        [[ ! `grep ^"${ENV}_APPS_CLUSTERING" ${SERVERS_ARR_FILE} | grep -w BPC` ]] && break # break loop after first node if environment is not dedicated for HA
+    fi
+done
+
+source ${BIN_PATH}/common_after

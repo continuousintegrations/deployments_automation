@@ -1,0 +1,279 @@
+#!/bin/bash -
+# AIF control tool by adam.chalat@comarch.com
+# application by default is running on port 8181 (frontend: <IP_ADDRESS>:8181/hawtio)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="24.07.2017r."
+SCRIPT_VERSION="0.0.12"
+
+CURRENT_USER=${USER}
+PID_FILE=~/bin/PID_files/$(basename $0).pid
+trap "rm -f -- '${PID_FILE}'" EXIT # remove PID file on exit
+
+source ~/bin/location_finder
+[[ $1 == '--version' ]] && { echo $(basename `readlink "${SHOW_DEFAULT_PATH}/current"` | sed 's|.*aif-solution-assembly-||g'); exit 0; }
+
+#--------------------------------------------------------------------#
+#-------------------------- HELP FUNCTION ---------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nAIF control tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [server]: all"
+	echo "Available parameter [task]: start, stop, restart, status"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [server] [task] [environment]")\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#---------------------------- PARAMETERS ----------------------------#
+#--------------------------------------------------------------------#
+
+SERVER_NAME=${1,,}
+JOB=${2,,}
+ENV_NAME=${3^^}
+CUR_NAME=${4,,}
+
+PARENT_PID=$$
+NOERROR=`echo "${@: -1}"` # avoid getting errors, when using server_manage (--noerror)
+ERROR=0; APPLICATION_INTERNAL_ERROR='' # reset to original state (used during status check)
+APP_CLUSTER='FALSE' # show cluster status only for HA inductions
+
+#--------------------------------------------------------------------#
+#----------------------------- PATH ---------------------------------#
+#--------------------------------------------------------------------#
+
+AIF_HOME=${SHOW_DEFAULT_PATH}/current
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/aif_manage
+
+#--------------------------------------------------------------------#
+#------------------------- CHECK PARAMETERS -------------------------#
+#--------------------------------------------------------------------#
+
+declare -a SERVER_NAME_ARR=("all")
+declare -a JOB_ARR=("start" "stop" "restart" "status")
+
+if [[ -z $(echo "${SERVER_NAME_ARR[@]:0}" | grep -w ${SERVER_NAME}) ]]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong parameter. Please see below"
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Available parameters [server]: all\n"
+	exit 1
+elif [[ -z $(echo "${JOB_ARR[@]:0}" | grep -w $JOB) ]]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong parameter. Please see below."
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Available parameters [task]: start, stop, restart, status\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------ RESTARTING FUNCTION -----------------------#
+#--------------------------------------------------------------------#
+
+function STOP_PROCESSES() {
+	if [[ "${SERVER_NAME}" == 'all' ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w AIF` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]); then
+		echo -e "\n$(colored "34" "Stopping AIF components on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+		${AIF_HOME}/bin/stop; sleep 15
+
+		processes=`ps -fu ${USER} | grep 'aif-solution-assembly\|/opt/aif/current' | grep -v grep | awk '{printf "%s ", $2}'`
+		if [[ "$processes" ]]; then 
+			echo -e "$(colored "31" "Remaining PIDs:")" $processes"on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+			ps -fu ${USER} | grep 'aif-solution-assembly\|/opt/aif/current' | grep -v grep | awk '{print $2}' | xargs kill -9 &>/dev/null
+			echo -e "Successfully force killed PIDs: ${SERVER_NAME} on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+		fi
+		echo "AIF stopped successfully on ${IP_ADDRESS} ( ${HOSTNAME} )"
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- STARTING FUNCTION ------------------------#
+#--------------------------------------------------------------------#
+
+function START_PROCESSES() {
+	if [[ "${SERVER_NAME}" == 'all' ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w AIF` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]); then
+		echo -e "\n$(colored "34" "Starting AIF components on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+		${AIF_HOME}/bin/start
+
+		counter=1
+		while [ 1 ]; do
+			if [[ `wget --timeout=10 --tries=1 --spider http://${IP_ADDRESS}:8181/hawtio/ -O - 2>&1` =~ '200 OK' ]]; then
+				echo -e "$(colored "32" "[ INFORMATION ]") AIF frontend is responding on port 8181"
+				break
+			elif [ ${counter} -eq 20 ]; then
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") AIF frontend login screen is unreachable ( http://${IP_ADDRESS}:$4/hawtio )"
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") Application logfiles: `readlink "${AIF_HOME}"`/data/log"
+			fi
+			echo "[${counter} out of 20] Waiting for AIF frontend on ${IP_ADDRESS} ( ${HOSTNAME} ) -" $((15*${counter})) "sec"
+			counter=$((${counter}+1))
+			sleep 15
+		done
+		[[ "${JOB}" != 'restart' ]] && STATUS_PROCESSES # display status if 'start' option was in induction arguments ('restart' option by default shows status) 
+	fi
+}
+
+#--------------------------------------------------------------------#
+#-------------------------- STATUS FUNCTION -------------------------#
+#--------------------------------------------------------------------#
+
+function get_process_parameters() {
+	stime=`ps -p $1 -o lstart= | awk '{print $2 $3}'` # start day
+	upwork=`ps -p $1 -o lstart= | awk '{print $4}'` # start time
+	cpu=`ps -p $1 -o %cpu= | awk '{print $1}'` # cpu load
+	memory=`ps -p $1 -o %mem= | awk '{print $1}'` # memory load
+	echo -e "PID: [ $(colored "35" "$(printf "%5d" $APP_PID)") ] Stime: [ $(colored "36" "$stime") $(colored "36" "$upwork") ]" \
+	"CPU: [ $(colored "31" "$(printf "%4s" $cpu)") ] PMEM: [ $(colored "33" "$(printf "%4s" $memory)") ] AIF application $(colored "32" "is responding") on 8181 port"
+}
+
+function STATUS_PROCESSES() {
+	if [[ "${SERVER_NAME}" == 'all' ]] && ([[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w AIF` ]] || [[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]]); then
+		echo -e "\n$(colored "34" "Testing AIF components on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+		# check if AIF has fully started
+
+		AIF_WGET=$(wget --timeout=10 --spider http://${IP_ADDRESS}:8181/hawtio/ -O - 2>&1)
+		if [[ ${AIF_WGET} =~ .*${IP_ADDRESS}:8181.*connected ]] && [[ ! `${AIF_HOME}/bin/status 2>&- | grep -q 'Not Running'` ]]; then
+			APP_PID=$(ps -fu `whoami` | grep 'karaf server' | grep -v grep | awk '{print $2}')
+			get_process_parameters ${APP_PID}
+			APPLICATION_INTERNAL_ERROR+=0
+		else
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") AIF components were not launched entirely. Please contact ITOPS department in urgent cases."
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") Application configuration: `readlink "${AIF_HOME}"`/etc"
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") Application logfiles: `readlink "${AIF_HOME}"`/data/log"
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") Correctness of application configuration and availability of external services should be veryfied."
+			echo -e "$(colored "31" "[ CRITICAL ERROR ]") Broken application modules should be restarted by accessing mubemanage script."
+			[[ ${NOERROR} != '--noerror' ]] && APPLICATION_INTERNAL_ERROR+=1 || APPLICATION_INTERNAL_ERROR+=0
+		fi
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- REMOTE HOSTS -----------------------------#
+#--------------------------------------------------------------------#
+
+function REMOTE_AIF() {
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		if [ "${SERV[0]}" = "${SHOW_ENV_NAME}" -a "${SERV[1]}" = "AIF" -a "${SERV[3]}" != "1" ]; then
+			APP_CLUSTER='TRUE'
+			ssh -qo BatchMode=yes ${SERV[2]} "bash -l -c 'aif_manage $1 $2 $ENV_NAME'" 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED."
+			PIPE_EXIT_STATUS=${PIPESTATUS[0]} # save pipe status (variable is overwritten during executing scripts commands)
+			([[ $2 == 'status' ]] && [[ ${PIPE_EXIT_STATUS} -ne 0 ]]) && APPLICATION_INTERNAL_ERROR+=1 || APPLICATION_INTERNAL_ERROR+=0
+		fi
+	done
+}
+
+#--------------------------------------------------------------------#
+#------------------------- COPYING SCRIPTS --------------------------#
+#--------------------------------------------------------------------#
+
+function MD5_SUM() {
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		# update scripts for current environment, declared environment type and for nodes that are different than set: current IP and current user
+		if [[ "${SERV[0]}" = "${SHOW_ENV_NAME}" && "${SERV[1]}" == 'AIF' && "${SERV[6]} ${SERV[4]}" != "${IP_ADDRESS} ${CURRENT_USER}" ]]; then
+			SSH_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${SERV[4]}@${SERV[2]} echo confirmed 2>&1)
+			if [[ $SSH_STATUS == 'confirmed' ]]; then
+				SUM=(`ssh -qo BatchMode=yes ${SERV[4]}@${SERV[2]} md5sum $(echo ${SCRIPT_DIR} | sed "s|${CURRENT_USER}|${SERV[4]}|g") 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED."`)
+				if [[ ${md5_local[0]} != ${SUM[0]} ]]; then
+					RESULT=$(scp -pq ${SCRIPT_DIR} ${SERV[4]}@${SERV[2]}:$(echo ${SCRIPT_DIR} | sed "s|${CURRENT_USER}|${SERV[4]}|g") 2>&1); CODE=$?
+					if [ ${CODE} -ne 0 ]; then
+						echo -e "$(colored "31" "[ CRITICAL ERROR ]") Script `basename "$0"` encountered errors during scripts update (please contact ITOPS department)"
+						echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error line: ${RESULT}"
+						echo -e "$(colored "31" "[ CRITICAL ERROR ]") Error code: ${CODE}"
+						exit 1
+					fi
+				fi
+			else
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") Script `basename "$0"` encountered errors during execution (please contact ITOPS department)"
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") SSH connection to remote host: ${SERV[4]}@${SERV[2]} is denied"
+				exit 1
+			fi
+		fi
+	done
+}
+
+#--------------------------------------------------------------------#
+#------------------------- PRECONDITIONS ----------------------------#
+#--------------------------------------------------------------------#
+
+# check if user links to proper environment
+if [ ${SHOW_ENV_NAME,,} != ${ENV_NAME,,} ]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong environment was definied during script induction."
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Current environment: ${SHOW_ENV_NAME^^}. Definied environment: ${ENV_NAME^^}.\n"
+	exit 1
+fi
+
+# check if another process is running in parallel
+if [[ "${JOB}" =~ ^(stop|restart|start)$ ]]; then
+	mkdir -p ~/bin/PID_files # create required folders
+	([[ -f "$PID_FILE" ]] && [[ `cat $PID_FILE` ]]) && echo -e "$(colored "31" "[ WARNING ]") Another process with `cat $PID_FILE` PID is already written to $(basename $0).pid lockfile on ${IP_ADDRESS} ( ${HOSTNAME} )"
+	for CHECK_ANOTHER_PID in $(pidof -x $(basename $0)); do
+		if [ ${CHECK_ANOTHER_PID} != ${PARENT_PID} ]; then
+			echo -e "$(colored "31" "[ WARNING ]") Terminating already running process with ${CHECK_ANOTHER_PID} PID on ${IP_ADDRESS} ( ${HOSTNAME} )"
+			kill -9 ${CHECK_ANOTHER_PID} &>/dev/null # kill silently
+		fi
+	done
+	echo ${PARENT_PID} > "${PID_FILE}"
+fi
+
+# update scripts on all nodes - comparing to main node
+if [[ "${JOB}" =~ ^(stop|restart|start|status)$ ]] && [[ -z $(echo "$@" | grep -w 'current') ]] && [[ `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w 'AIF'` ]]; then
+	if [ "${IP_ADDRESS}" = "${LOCAL_HOST}" ] && [ ${REMOTE_HOST} != '0' ]; then
+		md5_local=`md5sum ${SCRIPT_DIR} | awk '{ print $1 }'`
+		MD5_SUM
+	fi
+fi
+
+# checking if addiotional nodes are present and meet the requirements of release
+if [ "${IP_ADDRESS}" = "${LOCAL_HOST}" ] && [ ${REMOTE_HOST} != '0' ] && [[ ! "${CUR_NAME}" =~ ^(current|noerror)$ ]]; then
+	[[ "${SYSTEM_VERSION}" -ge '73' ]] && CHECK_NODES="TRUE"
+fi
+
+[[ ! `grep ^"${ENV_NAME}_APPS_CLUSTERING" ~/bin/servers.arr | grep -w 'AIF'` ]] && {
+	echo -e "\n$(colored "31" "[ INFORMATION ]") Application has not been configured according to high availability requirements"
+	echo -e "$(colored "31" "[ INFORMATION ]") Binaries need to be deployed and configured on remote hosts. Please contact ITOPS department."
+	CHECK_HA_APP='FALSE'
+} || CHECK_HA_APP='TRUE'
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTIONS CALL ---------------------------#
+#--------------------------------------------------------------------#
+
+# create tasks list if was definied switch requiring serveral basic tasks
+[[ "${JOB}" == 'restart' ]] && PROCESS_TASK="stop start status" || PROCESS_TASK="${JOB}"
+
+for TASK in ${PROCESS_TASK}; do
+	# execute task on remote hosts only when script was launched from localhost and has no additional arguments pointing to current host and application is configured according to HA requirements
+	[[ "${IP_ADDRESS}" = "${LOCAL_HOST}" ]] && [[ -z $(echo "$@" | grep -w 'current') ]] && [[ ${CHECK_NODES} = "TRUE" ]] && [[ ${CHECK_HA_APP} == 'TRUE' ]] && REMOTE_AIF "${SERVER_NAME}" "${TASK}"
+	! ([[ "${IP_ADDRESS}" != "${LOCAL_HOST}" ]] && [[ ${CHECK_HA_APP} == 'FALSE' ]]) && "${TASK^^}"_PROCESSES
+done
+
+#--------------------------------------------------------------------#
+#----------------------- REQUIREMENTS CHECK -------------------------#
+#--------------------------------------------------------------------#
+
+if [[ ${APP_CLUSTER} == 'TRUE' ]]; then
+	if [[ ${APPLICATION_INTERNAL_ERROR} =~ '1' ]]; then
+		echo -e "\n$(colored "33" "[ CRITICAL ERROR ]") Application encountered internal errors on one of the clustered nodes"
+		echo -e "$(colored "33" "[ CRITICAL ERROR ]") Misbehaving instances should be launched after resolving encountered errors"
+		[[ ${APPLICATION_INTERNAL_ERROR} =~ '0' ]] && 
+		{ echo -e "$(colored "33" "[ CRITICAL ERROR ]") Continuity of system operations is guaranteed due to working application cluster"; exit 2; } || \
+		{ echo -e "$(colored "31" "[ CRITICAL ERROR ]") Continuity of system operations is not guaranteed due to broken application cluster"; exit 1; }
+	fi
+fi
+
+# return code 2 (application cluster is working partially), code 1 (whole cluster is broken) and code 0 (application cluster is working correctly)
+[[ ${APPLICATION_INTERNAL_ERROR} =~ '1' ]] && { [[ ${APPLICATION_INTERNAL_ERROR} =~ '0' ]] && exit 2 || exit 1; } || exit 0

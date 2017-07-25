@@ -1,0 +1,155 @@
+#!/bin/bash -
+# implemented backup mechanisms for applications (ElasticSearch) and database schemas (MBCore)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="04.07.2017r."
+SCRIPT_VERSION="0.1.1"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common # load variables (required double load profile, when script variables are loaded)
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ] || ([ $# -lt 4 ] && [[ ${VARIABLE} == 'elasticsearch' ]]); then
+    echo -e "\nDatabase and applications archiver tool by \e[32madam.chalat@comarch.com\e[0m"
+    echo -e "Version: \e[35m${SCRIPT_VERSION}\e[0m | Last modification: \e[35m${BUILD_DATE}\e[0m\n"
+    echo "This script requires below parameters:"
+    echo "Available parameter [environment]: `grep ^ENV_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+    echo "Available parameter [task]: elasticsearch, mbcore"
+    echo -e "Available parameter [backup_method]: old, new, reconstruction\n (required only for ElasticSearch backup)"
+    echo -e "Usage: \e[36mimport_crm_configuration [release] [environment] [task] [backup_method]\e[0m\n"
+    exit 1
+fi
+
+#--------------------------------------------------------------------#
+#-------------------------- INPUT DATA ------------------------------#
+#--------------------------------------------------------------------#
+
+# first parameter: STEP_NAME, second: REMOTE_ZIP_DIR type, third: COMMAND
+[ ${VARIABLE} == 'elasticsearch' ] && declare -a SCRIPT_CONF=("ElasticSearch_backup" "CPM")
+[ ${VARIABLE} == 'mbcore' ] && declare -a SCRIPT_CONF=("MBCore_backup" "CRM")
+
+STEP_NAME="${SCRIPT_CONF[0]}"
+ENV_TYPE="${SCRIPT_CONF[1]}"
+
+RHOME=`grep -w ^"$2" ${SERVERS_ARR_FILE} | grep ${ENV_TYPE} | head -n1 | awk '{ print $6 }'` # common file is loaded later
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+
+#--------------------------------------------------------------------#
+#--------------------------- PATH -----------------------------------#
+#--------------------------------------------------------------------#
+
+BACKUP_METHOD=$4
+ES_DIR=${RHOME}/servers/ES
+BACKEND_SCRIPTS=${RHOME}/servers/launcher/current/bss-backend/scripts
+
+CRM_DB_PATH=${RHOME}/liquibase
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTIONS --------------------------------#
+#--------------------------------------------------------------------#
+
+# ELASTICSEARCH BACKUP
+# old method is based on performing data backup directly on server, new method is based on daily snapshots (defined MFT resource)
+# third script call parameter defines backup method: old or new
+# backup mechanisms: backup_new_method and es_reconstruction are implemented directly in es_manage script
+
+function copy_to_server_es() {
+    fLog "Copying ElasticSearch manage script"
+    fLog "Destination directory: ${BIN_DIR}"
+    RESULT=$(scp -pq ${TOSERVERS_PATH}/es_manage ${USER}@${HOST}:${BIN_DIR} 2>&1)
+    CODE=$?; check_errors
+    run_remote_command ${SERV[2]} "chmod 764 ${BIN_DIR}/es_manage" # adding execute permissions for script
+    fLog "ElasticSearch manage script copied successfully"	
+}
+
+function backup_old_method() {
+    function inside_loop() {
+        fLog "Performing ElasticSearch backup"
+        run_remote_command ${SERV[2]} "cd ${ES_DIR}; tar -czf es_${ENV}_backup_`date +%Y-%m-%d-%H%M`.tar.gz */data" # colon inside time causes error in combination with tar command
+        fLog "ElasticSearch backup completed successfully"
+    }
+
+    run_remote_command ${SERV[2]} "es_manage all stop ${ENV}" # stop ElasticSearch's instances
+    for SERVER in "${SERVERS_ARRAY[@]}"; do
+        SERV=($SERVER)
+        if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "CPM" ]]; then # backup of ES data for all nodes
+            local USER="${SERV[4]}"; local HOST="${SERV[2]}" # avoid overwriting variables for next function
+            inside_loop
+        fi
+    done
+    run_remote_command ${SERV[2]} "es_manage all start ${ENV}" # start ElasticSearch's instances
+}
+
+function backup_new_method() {
+    fLog "Performing ElasticSearch backup"
+    run_remote_command ${SERV[2]} "es_manage all backup ${ENV}"
+    fLog "ElasticSearch backup completed successfully"
+}
+
+function es_reconstruction() {
+    fLog "Performing ElasticSearch reconstruction based on database data"
+    run_remote_command ${SERV[2]} "es_manage all reconstruction ${ENV}"
+    fLog "ElasticSearch reconstruction completed successfully"
+}
+
+# MBCORE BACKUP
+# backup is executed only on main CRM node (based on liquibase changeset)
+
+function copy_to_server_mbcore() {
+    run_remote_command ${HOST} "mkdir -p ${CRM_DB_PATH}/utilities/Logs" # create required directories
+    
+    fLog "Copying MBCore backup scripts"
+    fLog "Destination directory: ${CRM_DB_PATH}/utilities"
+    RESULT=$(scp -pq ${TOSERVERS_PATH}/DataUpgrade_Prerequisites.zip ${USER}@${HOST}:${CRM_DB_PATH}/utilities 2>&1)
+    CODE=$?; check_errors
+    fLog "$(colored "32" "[ INFORMATION ]") MBCore backup scripts copied successfully"
+}
+
+function mbcore_backup() {
+    fLog "Unpacking MBCore liquibase changeset"
+    run_remote_command ${HOST} "unzip -o ${CRM_DB_PATH}/utilities/DataUpgrade_Prerequisites.zip -d ${CRM_DB_PATH}/utilities/"
+
+    fLog "MBCore backup"
+    run_remote_command ${HOST} "chmod 764 ${CRM_DB_PATH}/utilities/dataupgrade_deploy.sh" # adding execute permissions for script
+    run_remote_command ${HOST} "${CRM_DB_PATH}/utilities/dataupgrade_deploy.sh DataUpgrade_Prerequisites"
+    fLog "$(colored "32" "[ INFORMATION ]") MBCore backuped successfully"
+}
+
+#--------------------------------------------------------------------#
+#------------------------ FUNCTION CALL -----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+    SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" ]] && [[ "${SERV[3]}" = "1" ]]; then
+        HOST="${SERV[2]}"; USER="${SERV[4]}"
+        if [[ ${VARIABLE} == 'elasticsearch' ]] && [[ "${SERV[1]}" = "CPM" ]]; then
+            copy_to_server_es
+            [[ "${BACKUP_METHOD}" = 'old' ]] && backup_old_method || :
+            [[ "${BACKUP_METHOD}" = 'new' ]] && backup_new_method || :
+            [[ "${BACKUP_METHOD}" = 'reconstruction' ]] && es_reconstruction || :
+        elif [[ ${VARIABLE} == 'mbcore' ]] && [[ "${SERV[1]}" = "CRM" ]]; then
+            copy_to_server_mbcore
+            mbcore_backup
+        fi
+    fi
+done
+
+source ${BIN_PATH}/common_after

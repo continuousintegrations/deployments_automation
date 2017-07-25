@@ -1,0 +1,173 @@
+#!/bin/bash -
+# build_date=11.07.2017
+# check softlink 'tum-restapi' if exists and is not broken (if condition is not positive remove existing extracted binaries with the same version name)
+# default options for application - key 'TUM_APP_CONF'
+# application should be declared in '${ENV}_APPS_CLUSTERING' key, if clustering is mendatory
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+# softlinks validation (function is sourced from common file) - first argument: deployment softlink name, second argument: primary softlink, third argument: application type
+trap 'component_validation deployment_TUM_current tum-restapi TUM "$@"' EXIT
+
+STEP_NAME="TUM_copyextract"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep -w "^$ENV" ${SERVERS_ARR_FILE} | grep TUM | head -n1 | awk '{ print $6 }' | cut -d"/" -f1-2 | sed 's|$|/tum|'`
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+TUM_BINARIES_SELF_EXTRACT=$(basename `find ${VERSION_DIR} -name "tum-install*.sh" -printf '%T+ %p\n' | tail -n1 | awk '{print $2}'` 2>/dev/null)
+if [[ ${TUM_BINARIES_SELF_EXTRACT} ]]; then
+    fLog "$(colored "34" "[ INFORMATION ]") Found self extracting TUM binaries: ${TUM_BINARIES_SELF_EXTRACT}"
+else
+    fLog "$(colored "34" "[ INFORMATION ]") Self extracting TUM binaries were not found. Processing implemented mechanism"
+    TUM_RESTAPI=$(basename `find ${VERSION_DIR} -maxdepth 1 -name "tum-restapi-*.zip" -printf '%T+ %p\n' | tail -n1 | awk '{print $2}'`) # component full name (get the newest from package)
+    TUM_VERSION=$(echo ${TUM_RESTAPI} | sed "s|^tum-restapi-||" | sed "s|.zip$||") # only version
+
+    TUM_BUILDS="${RHOME}/versions"
+    TUM_DIRECTORY=${TUM_BUILDS}/${TUM_VERSION} # destination directory of installed binaries
+fi
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function check_version() {
+    VERSION_EXISTS='' # reset to original state (variable is overwritten during loop)
+
+    fLog -n "Checking if TUM version: ${TUM_VERSION} is installed on ${HOST} environment"
+    CHECK_VERSION=`zipinfo -1 ${VERSION_DIR}/${TUM_RESTAPI} | head -n1 | cut -d"/" -f1 | sed "s/^tum-restapi-//"` # name of delivered TUM version
+    CHECK_CURRENT=$(run_remote_command ${HOST} -n "[[ -L "${RHOME}/tum-restapi" ]] && [[ -e "${RHOME}/tum-restapi" ]]"); CODE_EXPORT=$? # check if softlink exists and is not broken (export flag for further actions)
+    if [ ${CODE_EXPORT} -eq 0 ]; then
+        TUM_INSTALLED=`run_remote_command ${HOST} "ls -t ${TUM_BUILDS} | head -1 | sed 's#.*/##'" | tail -n1` # currently installed version of TUM on environment
+        if [[ ${CHECK_VERSION} != ${TUM_INSTALLED} ]]; then 
+            fLog "$(colored "32" "[ INFORMATION ]") Version doesn't exist on ${HOST} environment. Processing component deployment."
+        else
+            fLog -n "$(colored "31" "[ WARNING ]") Version is present on target ${HOST} environment. Aborting component deployment."
+            VERSION_EXISTS="true"
+
+            # copy 'current' softlink for the purpose of changes propagation (properties_config.xml is modified if HOT_DEPLOY is enabled)
+            [[ ${@: -1} == '--silent' ]] && run_remote_command ${HOST} "cp -P ${SERV[5]}/tum-restapi ${SERV[5]}/deployment_TUM_current" || :
+        fi
+    else
+        fLog -n "$(colored "31" "[ WARNING ]") TUM is not installed on ${HOST} environment. Processing component deployment."
+        fLog "$(colored "31" "[ WARNING ]") No data will be imported from previously installed version."
+    fi
+
+    if [[ ${VERSION_EXISTS} != 'true' ]]; then
+        if [[ ${@: -1} == '--silent' ]]; then
+            fLog "$(colored "32" "[ INFORMATION ]") Detected additional 'silent' switch. Processing component deployment on running system."
+            run_remote_command ${HOST} "rm -rf ${RHOME}/deployment_TUM_current" # remove softlink
+            run_remote_command ${HOST} "ln -s ${TUM_DIRECTORY}/${TUM_RESTAPI%.zip} ${RHOME}/deployment_TUM_current" # create needed softlink
+        else
+            echo -e "$(colored "32" "[ INFORMATION ]") There is no additional switch in script induction. Running default component deployment."
+        fi
+    fi
+}
+
+function copy_to_server() {
+    run_remote_command ${HOST} "mkdir -p ${TUM_BUILDS} ${RHOME}/zip_files" # create required directories
+
+    fLog "$(colored "32" "[ INFORMATION ]") Copying TUM binaries"
+    fLog "TUM version: $@"
+    fLog "Destination directory: ${RHOME}/zip_files"
+    rsync -vrltD --stats --human-readable -e ssh ${VERSION_DIR}/$@ ${USER}@${HOST}:${RHOME}/zip_files # used rsync instead of scp, beacuase of partial output and better handling for large files
+    CODE=$?; check_errors
+    fLog "$(colored "32" "[ INFORMATION ]") TUM binaries copied successfully"
+
+    fLog "Copying TUM management files"
+    fLog "Destination directory: ${RHOME}"
+    RESULT=$(scp -pq ${TOSERVERS_PATH}/tum_scripts.zip ${USER}@${HOST}:${RHOME} 2>&1)
+    CODE=$?; check_errors
+    fLog "$(colored "34" "[ INFORMATION ]") TUM management files copied successfully"
+}
+
+function management_files() {
+    fLog "Updating TUM management scripts"
+    run_remote_command ${HOST} "unzip -qo ${RHOME}/tum_scripts.zip -d ${RHOME}/bin"
+    run_remote_command ${HOST} "mv ${RHOME}/bin/packages ${TUM_DIRECTORY}"
+    run_remote_command ${HOST} "find ${RHOME}/bin -type f -exec chmod 764 {} \;" # add executable state for scripts
+
+    fLog "Creating required configuration files"
+    run_remote_command ${HOST} "echo \`hostname\` >> ${TUM_DIRECTORY}/solutionkey"
+    run_remote_command ${HOST} "sed -i.bak \"/^TUM_RESTAPI_VERSION=/ s/$/${TUM_VERSION}/\" ${TUM_DIRECTORY}/packages" # configure key 'TUM_RESTAPI_VERSION'
+    run_remote_command ${HOST} "sed -i.bak \"s|TUM_HTTPD_START.*|TUM_HTTPD_START=\\$`grep ^TUM_APP_CONF ${SERVERS_ARR_FILE} | awk '{print $2}'`|g\" ${RHOME}/bin/tum-profile" # configure key 'TUM_HTTPD_START'
+    run_remote_command ${HOST} "sed -i.bak \"s|TUM_CAS_START.*|TUM_CAS_START=\\$`grep ^TUM_APP_CONF ${SERVERS_ARR_FILE} | awk '{print $3}'`|g\" ${RHOME}/bin/tum-profile" # configure key 'TUM_CAS_START'
+    run_remote_command ${HOST} "sed -i.bak \"s|TUM_RESTAPI_START.*|TUM_RESTAPI_START=\\$`grep ^TUM_APP_CONF ${SERVERS_ARR_FILE} | awk '{print $4}'`|g\" ${RHOME}/bin/tum-profile" # configure key 'TUM_RESTAPI_START'
+}
+
+function update_binaries() {
+    if [ ${CODE_EXPORT} -eq 0 ]; then
+        fLog "Copying previous TUM suite instance from ${TUM_BUILDS}/${TUM_INSTALLED} to ${TUM_DIRECTORY}"
+        run_remote_command ${HOST} "cp -r ${TUM_BUILDS}/${TUM_INSTALLED} ${TUM_DIRECTORY}" # this task should be run on turned off application (only concerns when deployed are also CAS and HTTPD)
+
+        fLog "Deleting old TUM RestAPI instance: ${TUM_DIRECTORY}/tum-restapi"
+        run_remote_command ${HOST} "rm -rf ${TUM_DIRECTORY}/tum-restapi*"
+
+        if [[ ${@: -1} != '--silent' ]]; then
+            fLog "Updating softlink for currently installed ${TUM_VERSION} version"
+            run_remote_command ${HOST} "ln -sfn ${TUM_DIRECTORY}/${TUM_RESTAPI%.zip} ${RHOME}/tum-restapi" # update softlink for restapi
+        fi
+    elif [[ ${@: -1} != '--silent' ]]; then
+        fLog "Removing broken softlink and previously extracted version"
+        [[ -z ${TUM_DIRECTORY} ]] && stop_deployment "Aborting deployment, because of lacking \${TUM_DIRECTORY} variable" || :
+        run_remote_command ${HOST} "rm -rf ${RHOME}/tum-restapi ${TUM_DIRECTORY}" # remove broken softlink and currently extracted version
+        run_remote_command ${HOST} "ln -s ${TUM_DIRECTORY}/${TUM_RESTAPI%.zip} ${RHOME}/tum-restapi" # create needed softlink
+    fi
+
+    fLog "Unzipping TUM RestAPI archive into ${TUM_DIRECTORY}"
+    run_remote_command ${HOST} "unzip -q -o ${RHOME}/zip_files/${TUM_RESTAPI} -d ${TUM_DIRECTORY}"
+
+    management_files # update management scripts and profile
+    fLog "$(colored "34" "[ INFORMATION ]") TUM ${TUM_VERSION} version was installed properly on ${ENV} environment"
+}
+
+function self_extracing_binaries_upgrade() {
+    fLog "$(colored "34" "[ INFORMATION ]") Updating ${TUM_BINARIES_SELF_EXTRACT%.sh} TUM binaries"
+    run_remote_command ${HOST} "chmod 764 ${RHOME}/zip_files/${TUM_BINARIES_SELF_EXTRACT}"
+    run_remote_command ${HOST} "${RHOME}/zip_files/${TUM_BINARIES_SELF_EXTRACT} --target ${RHOME}"
+    fLog "$(colored "32" "[ INFORMATION ]") TUM binaries updated successfully"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+    SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "TUM" ]]; then
+        HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+        if [[ ${TUM_BINARIES_SELF_EXTRACT} ]]; then
+            copy_to_server "${TUM_BINARIES_SELF_EXTRACT}"
+            self_extracing_binaries_upgrade
+        else
+            check_version "$@"
+            if [[ ${VERSION_EXISTS} != "true" ]]; then
+                copy_to_server "${TUM_RESTAPI}"
+                update_binaries "$@"
+            fi
+        fi
+        [[ ! `grep ^"${ENV}_APPS_CLUSTERING" ${SERVERS_ARR_FILE} | grep -w TUM` ]] && break # break loop after first node if environment is not dedicated for HA
+    fi
+done
+
+source ${BIN_PATH}/common_after

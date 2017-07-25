@@ -1,0 +1,387 @@
+#!/bin/bash -
+# package management tool by adam.chalat@comarch.com
+# after successful upload repository to artifactory package is removed from server
+# script requires four parameters: release name, operation (download or upload), repository name and environment
+# backup is stored in repo-arch folder (currently disabled in artifactory repository)
+# script is running sequentially in cron (*/10 0-2,5-23 * * * /bin/cron/artifactory_referesh)
+# upload operation uses ${BIN_REPO}/deployment_binaries/${VERSION} directory and download operation uses ${BIN_REPO}/${VERSION} directory
+# to prevent endless loop there is tightening the length of upload package process
+# ${ENV} variable is replaced with ${ENVIRONMENT} variable
+# third argument - ${VARIABLE}, is used for checking parallel script inductions and script call correctness
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="12.07.2017r."
+SCRIPT_VERSION="0.1.54"
+
+#--------------------------------------------------------------------#
+#---------------------------- SOURCE --------------------------------#
+#--------------------------------------------------------------------#
+
+EXTRACTPACKAGE="true" # variable used during task execution validation (check ommiting for current script)
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+ENVIRONMENT=$4
+
+#--------------------------------------------------------------------#
+#------------------------------ HELP --------------------------------#
+#--------------------------------------------------------------------#
+
+if [[ $# -lt 4 ]]; then
+	echo -e "\nPackage management tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [release]: e.g. 7.3.6.2, 7.3.2.1to7.3.4.5, MIGRATION_7.1.1.1to7.3.3.3"
+	echo "Available parameter [operation]: upload, download"
+	echo "Available parameter [repository]: `grep ^ARTIFACTORY_REPOSITORIES ${SERVERS_ARR_FILE} | sed 's|^ARTIFACTORY_REPOSITORIES ||' | sed 's| |, |g'`"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`\n"
+	echo -e "Usage: $(colored "34" "extractpackage [release] [operation] [repository] [environment]")\n"
+	echo -e "$(colored "31" "[ WARNING ]") Expression 'to' is reserved for transversal versions\n"
+	stop_deployment "Incorrect induction of $(basename $0) script"
+fi
+
+#--------------------------------------------------------------------#
+#---------------------------- VARIABLES -----------------------------#
+#--------------------------------------------------------------------#
+
+REPOSITORY=`grep ^ARTIFACTORY_${ENVIRONMENT} ${SERVERS_ARR_FILE} | awk '{print $3}'` # Artifactory credentials (REPOSITORY)
+ART_USER=`grep ^ART_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $2}'` # Artifactory credentials (USER)
+ART_PASS=`grep ^ART_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $3}'` # Artifactory credentials (PASSWORD)
+REPO_PATH=`grep ^ART_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $4}'` # Artifactory credentials (REPO_PATH)
+AUTH_TOKEN=`grep ^SLACK_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $2}'` # Slack webhook (AUTH_TOKEN)
+ROOM_ID=`grep ^SLACK_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $3}'`  # Slack credentials (ROOM_ID)
+
+#--------------------------------------------------------------------#
+#---------------------------- FUNCTIONS -----------------------------#
+#--------------------------------------------------------------------#
+
+function extract_crm() {
+	TAR_FILE=`find ${RELEASE_DIR} -name *-CRM-*.tar`
+
+	if [ -z $TAR_FILE ]; then
+		fLog "CRM package wasn't delivered"
+	else
+		if [[ $1 = 'unpack_repository' ]]; then # used for generating package from artifactory repository
+			fLog "Extracting crm package: $(colored "34" "`basename ${TAR_FILE%.tar}`")"
+			mkdir -p ${RELEASE_DIR}/crm
+			tar -xf ${TAR_FILE} -C ${RELEASE_DIR}/crm --exclude=`tar -tf ${TAR_FILE} | grep Liquibase` # exlude liquibase from extracting (substitution functionality)
+			CODE=$?; check_errors
+		elif [[ $1 = 'unpack_liquibase' ]]; then
+			tar -xf ${TAR_FILE} -C ${RELEASE_DIR} `tar -tf ${TAR_FILE} | grep Liquibase` # extract only liquibase component to upload separately to artifactory repository
+			CODE=$?; check_errors
+		fi
+	fi
+}
+
+function notification() {
+	set_custom_variables slack_variables
+	POSIX_TIME=`date +%s` # timestamp
+	curl -X POST --data '{
+		"channel":"'"#${ROOM_ID}"'", "username":"Repository Supervisor",
+		"attachments": [{"fallback":"Extracting process information", "pretext":"'"Repository synchronization - updating remote repository"'",
+		"mrkdwn":"true", "color":"'"${COLOUR}"'", "title":"'"${TITLE}"'", "text":"'"${MESSAGE}\n<http://${TITLE_LINK}|Click here> for more details"'",
+		"footer":"Administrator contact: adam.chalat@comarch.com", "footer_icon":"https://platform.slack-edge.com/img/default_application_icon.png", "ts":"'"${POSIX_TIME}"'"}]}' -i ${AUTH_TOKEN}
+	unset https_proxy http_proxy # remove unnecessary variables (collisions with e.g. wget)
+}
+
+function extract_version() {
+	mkdir -p ${RELEASE_DIR}
+	tar -zxf ${line} -C ${RELEASE_DIR}
+	if [ $? = 0 ]; then
+		fLog "Extracting ${VERSION} release package"
+		extract_crm unpack_liquibase
+		fLog "${VERSION} - release extracted successfully"
+		
+		fLog "Archiving current release package"
+		mv ${line}{,.md5} ${ARCH_PATH}
+	fi
+}
+
+function extract_ngsf_sa() {
+	VERSION=`echo ${VERSION} | sed 's/-.*//'`
+	RELEASE_DIR=${BIN_REPO}/deployment_binaries/`echo \`basename ${line}\` | sed 's/-.*//'`
+	fLog "Displacement ${VERSION} release package to ${RELEASE_DIR}"
+	mkdir -p ${RELEASE_DIR}
+	cp ${line} ${RELEASE_DIR}
+
+	fLog "Archiving current release package"
+	mv ${line}{,.md5} ${ARCH_PATH}
+}
+
+function upload_to_artifactory() {
+	fLog "Uploading ${VERSION} to ${REPOSITORY} Artifactory repository"
+	if [[ `wget -S --spider --user=${ART_USER} --password=${ART_PASS} "http://${REPO_PATH}/${REPOSITORY}/${VERSION}/" 2>&1 | grep 'HTTP/1.1 200 OK'` ]]; then
+		fLog "Downloading ${VERSION}_package_logfile to update the file"
+		wget -erobots=off --no-verbose --no-parent -P ${RELEASE_DIR} --reject "index.html*" --recursive --level=1 --no-directories -A "*logfile*" --user=${ART_USER} --password=${ART_PASS} "http://${REPO_PATH}/${REPOSITORY}/${VERSION%.*}/${VERSION}/"
+	fi
+
+	find ${RELEASE_DIR} -maxdepth 1 -type f ! -name "*info" -exec basename {} \; | sort | sed "s/^/${VERSION} /" >> ${RELEASE_DIR}/${VERSION}_package_logfile # generate package contents, exclude *info files, max depth for search equals 1
+	find ${RELEASE_DIR} -maxdepth 1 -type f ! -name "*info" -print0 | 
+	while IFS= read -r -d '' filename; do
+		# upload to artifactory repository with sha1 checksum, if name have '_' character, then upload with subdirectories
+		CURL_STATUS=$(curl -u ${ART_USER}:${ART_PASS} -T ${filename} -H "X-Checksum-Sha1:`sha1sum ${filename} | awk '{print $1}'`" "http://${REPO_PATH}/${REPOSITORY}/${VERSION%.*}/${VERSION}/")
+		if [[ $? -ne 0 ]]; then
+			echo -e "\nErrors during uploading component: ${filename} to remote repository"
+			TITLE="Information about ${VERSION} release"; MESSAGE="Version was unsuccessfully uploaded to Artifactory repository.\nPlease check ${BIN_REPO}/uploaded_packages logfile directory."; TITLE_LINK="${REPO_PATH}"; COLOUR='danger'; notification
+			exit 1
+		else
+			echo -e "\nSuccessfully uploaded component: ${filename}"
+		fi
+	done 
+
+	rm -r "${RELEASE_DIR}" # removing temporary directory
+	fLog "\nPackage ${VERSION} was successfully uploaded to ${REPOSITORY} Artifactory repository"
+	TITLE="Information about ${VERSION} release"; MESSAGE="Version was successfully uploaded to Artifactory repository"; TITLE_LINK="${REPO_PATH}"; COLOUR='good'; notification
+}
+
+function generate_package() {
+	RELEASE_DIR=${BIN_REPO}/${ENVIRONMENT}-${VERSION} # separate directory to avoid overwriting binaries during deployment
+
+	if [[ ! -d "${RELEASE_DIR}" ]]; then # avoid overwriting package during parallel deployments
+		fLog "Downloading $(colored "35" "${VERSION}") release from Artifactory repository"
+		if [[ `echo ${VERSION} | grep to` ]]; then # distinction between single version and multiple version
+			SUFFIX_START=${VERSION%to*}; SUFFIX_END=${VERSION#*to} # getting start and end range of deployed versions
+
+			if [[ `echo ${SUFFIX_START} | tr '.' ' ' | awk '{print $(NF-2)}'` -gt `echo ${SUFFIX_END} | tr '.' ' ' | awk '{print $(NF-2)}'` ]] || 
+				[[ `echo ${SUFFIX_START} | tr '.' ' ' | awk '{print $(NF-1)}'` -gt `echo ${SUFFIX_END} | tr '.' ' ' | awk '{print $(NF-1)}'` ]] ||
+				([[ `echo ${SUFFIX_START} | tr '.' ' ' | awk '{print $NF}'` -gt `echo ${SUFFIX_END} | tr '.' ' ' | awk '{print $NF}'` ]] \
+					&& [[ `echo ${SUFFIX_START} | tr '.' ' ' | awk '{print $(NF-1)}'` -eq `echo ${SUFFIX_END} | tr '.' ' ' | awk '{print $(NF-1)}'` ]]); then
+				fLog "$(colored "31" "[ WARNING ]") Initial version number: ${SUFFIX_START} and the final: ${SUFFIX_END} are incorrect. Summary range should be corrected."
+				stop_deployment "Initial version number: ${SUFFIX_START} and the final: ${SUFFIX_END} are incorrect"
+			fi
+		else
+			SUFFIX_END=${VERSION}
+		fi
+
+		for CHECK_REPO in ${SUFFIX_END} ${SUFFIX_START}; do
+			if ! [[ $(wget -S --spider --user=${ART_USER} --password=${ART_PASS} "http://${REPO_PATH}/${REPOSITORY}/${CHECK_REPO%.*}/${CHECK_REPO}/" 2>&1 | grep 'HTTP/1.1 200 OK') ]]; then # check if repository exists in artifactory
+				fLog "$(colored "31" "[ ERROR ]") Package ${CHECK_REPO} does not exist in Artifactory repository"
+				fLog "$(colored "31" "[ ERROR ]") Available versions can be veryfied at: http://${REPO_PATH}/${REPOSITORY}"
+				stop_deployment "Package ${CHECK_REPO} does not exist in Artifactory repository"
+			fi
+			[[ -z `echo ${VERSION} | grep to` ]] && break # both border versions must exist (based on them are removed versions to the output range)
+		done
+
+		fLog "$(colored "32" "[ REPOSITORY BRANCH ]") Branch ${SUFFIX_END%.*} exists in Artifactory repository. Generating package."
+		fLog "$(colored "32" "[ REPOSITORY BRANCH ]") URL address: http://${REPO_PATH}/${REPOSITORY}/${SUFFIX_END%.*}/"
+		fLog "$(colored "34" "Current version:") http://${REPO_PATH}/${REPOSITORY}/${SUFFIX_END%.*}/${SUFFIX_END}/"
+		wget -erobots=off --no-verbose --no-parent -qP ${RELEASE_DIR} --reject "index.html" --reject sha1,md5 --recursive --level=1 --no-directories --user=${ART_USER} --password=${ART_PASS} \
+		"http://${REPO_PATH}/${REPOSITORY}/${SUFFIX_END%.*}/${SUFFIX_END}/" # download whole directory, -P lets wget start creating sub folders depending on how you select options to download
+
+		function build_package() {
+			for COMPONENT in bss-db Liquibase CRM backend frontend cqrs DPS tum bpc aif; do
+				function CHECK_COMPONENT() { wget --user=${ART_USER} --password=${ART_PASS} -O - "http://${REPO_PATH}/${REPOSITORY}/${CURRENT_VERSION}/" | grep "${COMPONENT}"; } # check if component is present in package
+				function FIND_COMPONENT() { find ${RELEASE_DIR} -name "*${COMPONENT}*" -exec basename {} \; | sed ':a;N;$!ba;s/\n/ /g' | sed 's| |, |g'; } # find name of component already downloaded from repository (last: remove newline character)
+				function SEARCH_REPO() { curl -siu ${ART_USER}:${ART_PASS} "http://${REPO_PATH}/${REPOSITORY}/${CURRENT_VERSION}/" | grep ${COMPONENT} | grep -v sha1 | grep -v md5 | grep -o -P '(?<=href=").*(?=">)' | \
+				sed ':a;N;$!ba;s/\n/ /g' | sed 's| |, |g'; } # search for component names in repository
+
+				# first condition: download each component only once, second condition: download component only once per branch, third condition: download component from each release
+				if ([[ $COMPONENT =~ ^(`grep ^ARTIFACTORY_${ENVIRONMENT} ${SERVERS_ARR_FILE} | awk '{print $4}'`)$ ]] && ! [[ `ls -l ${RELEASE_DIR} | grep ${COMPONENT}` ]]) || \
+					([[ $COMPONENT =~ ^(`grep ^ARTIFACTORY_${ENVIRONMENT} ${SERVERS_ARR_FILE} | awk '{print $5}'`)$ ]] && ! [[ `ls -l ${RELEASE_DIR} | grep -P "(?=.*${COMPONENT}.*)(?=.*${CURRENT_VERSION%/*}.*)"` ]]) || \
+					[[ $COMPONENT =~ ^(`grep ^ARTIFACTORY_${ENVIRONMENT} ${SERVERS_ARR_FILE} | awk '{print $6}'`)$ ]]; then
+					CHECK_COMPONENT &>/dev/null
+					if [ $? = 0 ]; then
+						# messages distinction - for downloaded newer components and additional components
+						[[ $COMPONENT =~ ^(bss-db|Liquibase)$ ]] && \
+						fLog "$(colored "32" "[ INFORMATION ${CURRENT_VERSION} ]") There is additional version of $(colored "34" "${COMPONENT,,}") component - $(SEARCH_REPO). Downloading." || \
+						fLog "$(colored "32" "[ INFORMATION ${CURRENT_VERSION} ]") There is newer version of $(colored "34" "${COMPONENT,,}") component than contained in release $(colored "34" "${SUFFIX_END}") - $(SEARCH_REPO). Downloading."
+
+						# download component, -A switch is responsible for this task
+						wget -erobots=off --no-verbose --no-parent -qP ${RELEASE_DIR} --reject "index.html*" --reject sha1,md5 --recursive --level=1 --no-directories -A "*${COMPONENT}*" \
+						--user=${ART_USER} --password=${ART_PASS} "http://${REPO_PATH}/${REPOSITORY}/${CURRENT_VERSION}/"
+					else 
+						fLog -n "$(colored "31" "[ INFORMATION ${CURRENT_VERSION} ]") There is no $(colored "34" "${COMPONENT,,}") component to download from current release."
+					fi
+				else
+					fLog -n "$(colored "31" "[ INFORMATION ${CURRENT_VERSION} ]") Downloaded release is already containing $(colored "34" "${COMPONENT,,}") component - $(FIND_COMPONENT). Skipping download process."
+				fi
+			done
+		}
+
+ 		if [[ `echo ${VERSION} | grep to` ]]; then # iterate inside loop only if VERSION consists string 'to' (this string is forbidden for this case only)
+			# iterate inside repository, for second and third digit only (range determination X.X.X.X), be careful with variables overwriting
+			for (( VERSION_COUNTER = `echo ${SUFFIX_END} | tr '.' ' ' | awk '{print $(NF-2)}'`; VERSION_COUNTER >=`echo ${SUFFIX_START} | tr '.' ' ' | awk '{print $(NF-2)}'`; VERSION_COUNTER-- )); do
+				for (( VERSION_COUNT = `echo ${SUFFIX_END} | tr '.' ' ' | awk '{print $(NF-1)}'`; VERSION_COUNT >=`echo ${SUFFIX_START} | tr '.' ' ' | awk '{print $(NF-1)}'`; VERSION_COUNT-- )); do
+					if ! [[ $(wget -S --spider --user=${ART_USER} --password=${ART_PASS} "http://${REPO_PATH}/${REPOSITORY}/`echo ${SUFFIX_END} | cut -c -3`.${VERSION_COUNT}/" 2>&1 | grep 'HTTP/1.1 200 OK') ]]; then
+						fLog "$(colored "31" "[ REPOSITORY BRANCH ]") Branch `echo ${SUFFIX_END} | cut -c -3`.${VERSION_COUNT} does not exist in repository. Skipping."
+						fLog "$(colored "31" "[ REPOSITORY BRANCH ]") URL address: http://${REPO_PATH}/${REPOSITORY}/`echo ${SUFFIX_END} | cut -c -3`.${VERSION_COUNT}/"
+					else
+						fLog "$(colored "32" "[ REPOSITORY BRANCH ]") Branch `echo ${SUFFIX_END} | cut -c -3`.${VERSION_COUNT} exists in repository. Updating package."
+						fLog "$(colored "32" "[ REPOSITORY BRANCH ]") URL address: http://${REPO_PATH}/${REPOSITORY}/`echo ${SUFFIX_END} | cut -c -3`.${VERSION_COUNT}/"
+
+						wget --user=${ART_USER} --password=${ART_PASS} -O - "http://${REPO_PATH}/${REPOSITORY}/`echo ${SUFFIX_END} | 
+						cut -c -3`.${VERSION_COUNT}/" 2>&1 | grep "<a href=\".*</a>.*-" | sed 's|<a href="||g' | sed 's|/">.*||g' | awk '!seen[$0]++' | sed "/${SUFFIX_END}/q" | sort -r | sed "/${SUFFIX_START}/q" | sed "/${SUFFIX_END}/d" | 
+						while read CURRENT_VERSION; do
+							CURRENT_VERSION="`echo ${SUFFIX_END} | cut -c -3`.${VERSION_COUNT}/${CURRENT_VERSION}"
+							fLog "$(colored "34" "Current version:") http://${REPO_PATH}/${REPOSITORY}/${CURRENT_VERSION}/"
+							build_package
+						done
+					fi
+				done
+			done
+		fi
+
+		extract_crm unpack_repository
+		rm -rf ${RELEASE_DIR}/*.zip.* ${RELEASE_DIR}/*-CRM-* # cleaning directory of redundant files
+		mv ${RELEASE_DIR}/Liquibase* ${RELEASE_DIR}/crm 2>/dev/null # move files without errors
+
+		fLog "$(colored "32" "[ INFORMATION ]") Downloaded ${VERSION} release contains below components:"
+		find ${RELEASE_DIR} ${RELEASE_DIR}/crm -maxdepth 1 -type f -exec basename {} \; | sort | grep -v '.exe\|package_logfile\|.plb\|.html\|NYX\|build_working_directory'
+		fLog "Version $(colored "34" "${VERSION}") is ready. Processing deployment."
+	else
+		fLog "$(colored "31" "[ WARNING ]") Version $(colored "34" "${VERSION}") has been already downloaded. Processing deployment."
+		fLog "$(colored "31" "[ WARNING ]") Artifacts should be veryfied for the accuracy and the timeliness of downloaded data"
+	fi
+}
+
+function latest_repository() {
+	function CURL_CHECK() { curl -siu ${ART_USER}:${ART_PASS} "http://${REPO_PATH}/${REPOSITORY}/${1}/" | grep href=\" | grep -w - | sed 's|.*="||g' | sed 's|/".*||g' | sort -rV | head -n1; }
+	[[ $(CURL_CHECK `CURL_CHECK`) ]] && VERSION=${CHECK_SUBDIRECTORIES} || VERSION=`CURL_CHECK` # rewrite latest version, if curl check exists
+}
+
+function check_arch_repository() {
+	if [ -f "${ARCH_PATH}/${VERSION}.tar.gz.md5" ]; then
+		SUM3=(`cat ${ARCH_PATH}/${VERSION}.tar.gz.md5`)
+		fLog "MD5 checksum of archive version: ${SUM3[0]}"
+
+		if [ "${SUM2[0]}" = "${SUM3[0]}" ]; then
+			fLog "Version already exists. Removing delivered package."
+			rm -f ${line}{,.md5}
+			TITLE="Information about ${VERSION} release"; MESSAGE="Version with the same checksum exists in repository - no need to extract package"; TITLE_LINK="${REPO_PATH}"; COLOUR='warning'; notification
+			return 1
+		else
+			fLog -n "Found newer version, upgrading repository"
+			fLog "Removing previously extracted package and package from repository"
+			rm -rf ${ARCH_PATH}/${VERSION}.tar.gz{,.md5}
+
+			fLog "Removing previously uploaded package to Artifactory repository - http://${REPO_PATH}/${REPOSITORY}/${VERSION%.*}/${VERSION}"
+			curl -u ${ART_USER}:${ART_PASS} -XDELETE "http://${REPO_PATH}/${REPOSITORY}/${VERSION%.*}/${VERSION}"
+
+			find ${LOGS_DIR}/step_files -type f -name "deployment_*${VERSION}.stp" -exec rename .stp .stp.old '{}' +
+			[[ $? -eq 0 ]] && fLog "Deployment logfiles - deployment_*${VERSION}.stp, were archived - deployment_*${VERSION}.stp.old" || fLog -n "Deployment logfiles were not found (nothing was archived)"
+
+			TITLE="Information about ${VERSION} release"; MESSAGE="Version was successfully removed from source (Artifactory and Bamboo)"; TITLE_LINK="${REPO_PATH}"; COLOUR='warning'; notification
+		fi
+	fi
+}
+
+function update_version_string() {
+	if [[ ${FILES_ARRAY} ]] && [[ `grep ^DEPLOY_TRIGGER ${SERVERS_ARR_FILE} | grep ${ENVIRONMENT}` ]]; then # trigger deployment via REST API (based on build - variable injection ${bamboo.inject.release})
+		BUILD_DIR="${LHOME}/servers/bamboo-home/xml-data/build-dir"
+		DEPLOY_TRIGGER=`grep ^DEPLOY_TRIGGER ${SERVERS_ARR_FILE} | awk '{print $NF}'`
+		latest_repository
+		[ ! -f ${BUILD_DIR}/${DEPLOY_TRIGGER}/nightly_builds ] && echo release=initial_state > ${BUILD_DIR}/${DEPLOY_TRIGGER}/nightly_builds # create required files by external trigger_nightly_builds script
+		[ ! -f ${BUILD_DIR}/${DEPLOY_TRIGGER}/nightly_builds.bac ] && cp ${BUILD_DIR}/${DEPLOY_TRIGGER}/nightly_build ${BUILD_DIR}/${DEPLOY_TRIGGER}/nightly_builds.bac
+		if [[ `grep release ${BUILD_DIR}/${DEPLOY_TRIGGER}/nightly_builds | sed 's|.*=||g'` != "${VERSION}" ]]; then # avoid triggering build, when version did not change
+			# backup of file if required by external script to compare current and initial version string
+			sed -i.bac "s|=.*|=${VERSION}|g" ${BUILD_DIR}/${DEPLOY_TRIGGER}/nightly_builds # update latest version present in repository (for nightly builds) and create backup
+		fi
+	fi
+}
+
+function check_another_processes() {
+	if [[ `ps -ef | grep extractpackage | grep ${VARIABLE} | grep -v "grep\|$$" | wc -l` -ne 0 ]]; then # subtask should be run in background to avoid stopping another tasks, exclude parent process (indication in cron)
+		fLog "Another process is already uploading package to Artifactory - ${VARIABLE} induction"
+		exit 1
+	fi
+}
+
+#--------------------------------------------------------------------#
+#--------------------------- PREREQUISITES --------------------------#
+#--------------------------------------------------------------------#
+
+CHECK_SERVICE=$(wget -q --spider "http://${REPO_PATH%/*}") # check service availability silently
+if [[ $? -ne 0 ]]; then
+	fLog "$(colored "31" "[ WARNING ]") Artifactory service is not responding at http://${REPO_PATH%/*} address"
+	fLog "$(colored "31" "[ WARNING ]") Repository can be launched manually by executing command: <artifactory_path>/bin/artifactoryctl start"
+	stop_deployment "Artifactory service is not responding at http://${REPO_PATH%/*} address"
+elif [[ `grep ^ARTIFACTORY_REPOSITORIES ${SERVERS_ARR_FILE} | grep ${VARIABLE} | wc -l` -eq 0 ]]; then
+	fLog "$(colored "31" "[ WARNING ]") Configuration mismatch - ${VARIABLE} repository is not supported"
+	fLog "$(colored "31" "[ WARNING ]") Supported repositories: `grep ^ARTIFACTORY_REPOSITORIES ${SERVERS_ARR_FILE} | sed 's|^ARTIFACTORY_REPOSITORIES ||'`"
+	stop_deployment "This repository is not supported"
+elif [[ ${ENV} == 'download' ]] && [[ `grep ^ENV_LIST ${SERVERS_ARR_FILE} | grep ${ENVIRONMENT} | wc -l` -eq 0 ]]; then
+	fLog "$(colored "31" "[ WARNING ]") Configuration mismatch - ${ENVIRONMENT} environment is not supported"
+	fLog "$(colored "31" "[ WARNING ]") Supported environments: `grep ^ENV_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	stop_deployment "This environment is not supported"
+elif [[ `df -P ${BIN_REPO} | awk 'NR==2 {print $4}'` -lt 5242880 ]]; then # required free space 5GB (5*1024*1024k)
+	fLog "$(colored "31" "[ WARNING ]") Required space: $(colored "34" "5G"). Available space: `df -hP ${LHOME} | echo $(colored "34" "$(awk 'NR==2 {print $4}')")`."
+	fLog "$(colored "31" "[ WARNING ]") There is not enough space on the disk. Exiting."
+	stop_deployment "There is not enough space on the implementation disk"
+fi
+
+#--------------------------------------------------------------------#
+#-------------------------- PROGRAM CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+if [[ ${ENV} == 'download' ]]; then # ${ENV} second variable definied in common
+	generate_package
+elif [[ ${ENV} == 'nightly' ]]; then # overwriting ${VERSION} to get the latest number available in repository
+	latest_repository
+	generate_package
+else
+	check_another_processes # check if another process is running
+	DEFAULT_PATH=`grep ^ARTIFACTORY_${ENVIRONMENT} ${SERVERS_ARR_FILE} | awk '{print $2}'` # determine packages default location - ${BIN_REPO}/uploaded_packages/${DEFAULT_PATH}
+	FILES_ARRAY=$(find ${DEFAULT_PATH} -maxdepth 1 -name '*.tar.gz' | sort --version-sort) # create package matrix
+
+	if [[ ${FILES_ARRAY} ]]; then
+		printf '%s\n' "${FILES_ARRAY}" | while IFS= read -r line; do
+			VERSION=`basename ${line} .tar.gz` # ${line} contains package name with extension .tar.gz
+			RELEASE_DIR=${BIN_REPO}/deployment_binaries/${VERSION}
+
+			if [ ! -f ${line}.md5 ] && [ -f ${line} ]; then
+				fLog "Version ${VERSION} is not complete - no MD5 file. Waiting until upload is finished."
+				while [ ! -f ${line}.md5 ]; do
+					sleep 120
+					counter=$(($counter+1))
+
+					if [ $counter -eq 45 ];	then # prevent endless loop - 90min for upload the whole package
+						fLog "Package did not upload in regular time $((counter*2)). Removing package from repository."
+						rm -f ${line}{,.md5}
+						break
+					fi
+				done
+			fi
+
+			fLog "Found new ${VERSION} release. Processing repository update."
+			fLog "Processing file ${line}"
+
+			SUM1=(`md5sum ${line}`)
+			SUM2=(`cat ${line}.md5`)
+
+			fLog "MD5 file checksum: ${SUM1[0]}"
+			fLog "Checksum from MD5 file: ${SUM2}"
+
+			if [ -z ${SUM2[0]} ]; then
+				fLog "MD5 file is corrupted - lacking checksum. Exiting."
+				stop_deployment "MD5 file is corrupted - lacking checksum for ${line} release"
+			else
+				if [ ${SUM1[0]} = ${SUM2[0]} ]; then
+					fLog "Version ${VERSION} is fine. Processing."
+				else
+					fLog -n "MD5 checksums don't match. Removing corrupted files from server."
+					TITLE="Information about ${VERSION} release"; MESSAGE="MD5 checksums don't match. Removing corrupted files from server"; TITLE_LINK="${REPO_PATH}"; COLOUR='danger'; notification
+					rm -f ${line}{,.md5}
+					stop_deployment "MD5 checksums don't match. Removing corrupted files from server for ${line} release"
+				fi
+			fi
+
+			check_arch_repository # check if version exists in repo-arch directory (return 1)
+			if [[ "$?" -ne 1 ]]; then
+				[[ `echo $line | grep 'NGSF\|SA'` ]] && extract_ngsf_sa || { extract_version; update_version_string; }
+				upload_to_artifactory
+			fi
+		done
+	fi
+fi

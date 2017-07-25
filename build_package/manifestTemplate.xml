@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<root>
+	<header build-number="5203" export-date="Thu, 26 Mar 2015 11:08:08 +0100" type="layout-set" group-id="10403" private-layout="true" theme-id="crmLayout_WAR_crmLayout" color-scheme-id="01"/>
+	<import-configuration import-categories="false" import-permissions="true" import-roles-permissions="true" import-user-permissions="false" import-portlet-data="true" import-portlet-setup="true" import-portlet-archived-setups="true" import-portlet-user-preferences="false" import-theme="false" delete-missing-layouts="true" create-new-roles="true" delete-missing-permissions="false" delete-portlet-data="false"/>
+	<layouts>
+	</layouts>
+	<portlets>
+	</portlets>
+	<roles>
+	</roles>
+</root>

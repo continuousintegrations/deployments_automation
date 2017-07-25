@@ -1,0 +1,114 @@
+#!/bin/bash -
+# requirement: folder for each environment should be present in ${LHOME}/logs/semaphore
+# script requires three parameters: environment name, release and task (stop, start) (indication to the relevant logs in .stp file)
+# each component is started in bamboo by passing five parameters (last equal 'check' - GENERATE_FILE in server_manage)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="20.07.2017r."
+SCRIPT_VERSION="0.1.9"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nCheck background processes tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo -e "Available parameter [version]: indication to version which should be checked"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	echo -e "Available parameter [switch]: stop, start\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [version] [environment] [switch]")\n"
+	stop_deployment "Incorrect induction of $(basename $0) script"
+fi
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function manage_semaphore_container() {
+	# script server_manage generates file and inserts PID of process
+	# induction of script: $component $task $environment $release (to know which tasks run in background)
+	find ${LOGS_DIR}/semaphore/${ENV} -maxdepth 1 -type f -name "*_${VARIABLE}.pid" -exec basename {} \; | while read APP; do
+		fLog "$(colored "32" "[ INFORMATION ]") Found ${APP} semaphore file. Starting induction for corresponding application."
+		${BIN_PATH}/server_manage ${APP%_*} ${VARIABLE} ${ENV} ${VERSION} &
+	done
+	sleep 30 # suspension to avoid empty PIDs
+
+	fLog "Checking for child processes running in background" # check until processes pids exist and semaphore files are present
+	while [[ `find ${LOGS_DIR}/semaphore/${ENV} -name "*_${1}.pid" | wc -l` -ne 0 ]] && [ $(ps -fu `whoami` | grep -P "(?=.*[s]erver_manage.*${ENV})" | grep '[b]ss\|[c]rm\|[d]ps\|[j]r\|[t]um\|[b]pc\|[a]if' | wc -l) -ne 0 ]; do
+		# find files containing task name and print on screen proper pid of running process and corresponding name
+		processes=`find ${LOGS_DIR}/semaphore/${ENV} -type f -name "*_${1}.pid" -exec awk 'END{n=split (FILENAME,a,/\//); printf " [ \033[31m%s\033[0m ] " a[n],$0}' {} \;`
+
+		fLog "Remaining PIDs running in background:${processes}" # remove additional space
+		sleep 60
+	done
+
+	# check if applications were started with errors (processes are down, but semaphore files are present)
+	# condition fulfilled: shutdown applications and exit with error (deployment rerun is required)
+	if [ $(ps -fu `whoami` | grep -P "(?=.*[s]erver_manage.*${ENV})" | grep '[b]ss\|[c]rm\|[d]ps\|[j]r\|[t]um\|[b]pc\|[a]if' | wc -l) -ne 0 ]; then
+		LEFT_PROCESSES=$(ps -fu `whoami` | grep -P "(?=.*[s]erver_manage.*${ENV})" | grep '[b]ss\|[c]rm\|[d]ps\|[j]r\|[t]um\|[b]pc\|[a]if' | awk '{printf "%s ", $2}')
+		fLog "$(colored "31" "[ WARNING ]") Currently working processes, which are still working in background: ${LEFT_PROCESSES}"
+
+		ps -fu `whoami` | grep -P "(?=.*[s]erver_manage.*${ENV})" | grep '[b]ss\|[c]rm\|[d]ps\|[j]r\|[t]um\|[b]pc\|[a]if' | while read PROCESS_LINE; do
+			PROCESS_PID=`awk '{print $2}' <<< ${PROCESS_LINE}`
+			PROCESS_NAME=`awk '{print $11}' <<< ${PROCESS_LINE}` # gather from process details script's arguments (application management type)
+
+			fLog "\n$(colored "31" "[ WARNING ]") Found standalone process with ${PROCESS_PID} PID, which requires verification ( `awk '{out=$9; for(i=10;i<=12;i++){out=out" "$i}; print out}' <<< ${PROCESS_LINE}` )"
+			if grep -qi ${PROCESS_NAME^^}_application_${VARIABLE} ${LOGS_DIR}/step_files/${ENV}/deployment_${VERSION}.stp; then
+				fLog "$(colored "32" "[ INFORMATION ]") Process with ${PROCESS_PID} PID was already successfully written to deployment_${VERSION}.stp logfile"
+				fLog "$(colored "32" "[ INFORMATION ]") Associated script is probably performing post execution task. Ignoring process."
+			else
+				fLog "$(colored "31" "[ CRITICAL ERROR ]") Process with ${PROCESS_PID} PID was unsuccessfully written to deployment_${VERSION}.stp logfile. Terminating."
+				kill -9 ${PROCESS_PID} &>/dev/null
+
+				${BIN_PATH}/server_manage ${PROCESS_NAME,,} stop ${ENV} # shutdown wrongly opened applications (shutdown must remove additional processes of this script), avoid checking .stp file (no fourth parameter)
+				# protection against incorrect application shutdown (remove PID for both cases: stop and start)
+				if [ -f ${LOGS_DIR}/semaphore/${ENV}/${PROCESS_NAME,,}_${VARIABLE}.pid ]; then
+					fLog "$(colored "31" "[ CRITICAL ERROR ]") Script ${APPLICATION} did not shutdown application properly. Removing existing PID."
+					rm -rf ${LOGS_DIR}/semaphore/${ENV}/${APPLICATION%_manage}_*.pid
+				else
+					fLog "$(colored "32" "[ INFORMATION ]") Wrongly managed ${PROCESS_NAME^^} application was shutted down correctly"
+				fi
+				TITLE="Applications management occured errors during system administration"; MESSAGE="${PROCESS_NAME} application did not $1 properly\nInduction script: $(basename $0)"; COLOUR='warning'; send_to_slack &>/dev/null
+			fi
+		done
+	fi
+
+	if [[ `find ${LOGS_DIR}/semaphore/${ENV} -name "*_${1}.pid" | wc -l` -ne 0 ]]; then
+		FOUND_BROKEN_APPS=$(find ${LOGS_DIR}/semaphore/${ENV} -name "*_${1}.pid" -exec basename '{}' \; | sed ':a;N;$!ba;s/\n/ /g')
+		BROKEN_APPS=$(find ${LOGS_DIR}/semaphore/${ENV} -name "*_${1}.pid" -exec basename '{}' \; | sed 's|_.*||' | sed ':a;N;$!ba;s/\n/ /g' | tr '[:lower:]' '[:upper:]')
+
+		fLog "$(colored "31" "[ CRITICAL ERROR ]") Applications: ${BROKEN_APPS} did not $1 properly. Deployment logfiles should be verified."
+		fLog "$(colored "31" "[ CRITICAL ERROR ]") Left semaphore files, which were not erased, because of unsuccessful management: ${FOUND_BROKEN_APPS}"
+		fLog "$(colored "31" "[ CRITICAL ERROR ]") Processing deletion task for files from ${LOGS_DIR}/semaphore/${ENV} location"
+		fLog "$(colored "31" "[ CRITICAL ERROR ]") Deployment should be rerun, after applications and configuration verification"
+
+		rm -rf ${LOGS_DIR}/semaphore/${ENV}/*_${1}.pid
+		stop_deployment "Applications: ${BROKEN_APPS} did not $1 properly (check deployment logfiles)"
+	fi
+	fLog "$(colored "32" "[ INFORMATION ]") There are no more child processes running in background. Processing deployment."
+}
+
+
+#--------------------------------------------------------------------#
+#-------------------------- FUNCTION CALL ---------------------------#
+#--------------------------------------------------------------------#
+
+manage_semaphore_container ${VARIABLE} # script should be launched with arguments: ${COMPONENT} (bss, crm, etc.) ${TASK_TYPE} (stop or start) ${ENV} ${VERSION}

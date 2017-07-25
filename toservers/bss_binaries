@@ -1,0 +1,179 @@
+#!/bin/bash -
+# BSS binaries deployment tool by adam.chalat@comarch.com
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="18.07.2017r."
+SCRIPT_VERSION="0.1.11"
+
+source ~/bin/location_finder
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 2 ]; then
+	echo -e "\nBSS binaries deployment tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo -e "This script requires below parameters:"
+	echo -e "Available parameter [binaries]: -b backend-package, -c cqrs-package, -f frontend-package"
+	echo -e "Available parameter [options]: --silent (component deployment on running system - optionally)"
+	echo -e "$(colored "31" "[ WARNING ]") Each component can be installed separately (arguments should be given without commas)\n"
+	echo -e "Usage: $(colored "34" "bss_binaries [binaries] [options]")\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#--------------------------- VARIABLES ------------------------------#
+#--------------------------------------------------------------------#
+
+PATH_ENV="${SHOW_DEFAULT_PATH}/servers/launcher"
+PATH_ZIP_FILES="${SHOW_DEFAULT_PATH}/servers/zip_files"
+BUILDS_DIR="${PATH_ENV}/builds"
+
+#--------------------------------------------------------------------#
+#-------------------------- FUNCTIONS -------------------------------#
+#--------------------------------------------------------------------#
+
+function fParseArguments() {
+	while [ $# -ne 0 ]; do
+		case "$1" in
+			"-b") shift; BACKEND="$1"; echo "Recognized option '-b' with value: ${BACKEND}"; shift; BACKEND_FLAG="true";; # backend case
+			"-f") shift; FRONTEND="$1"; echo "Recognized option '-f' with value: ${FRONTEND}"; shift; FRONTEND_FLAG="true";; # frontend case
+			"-c") shift; CRMCQRS="$1"; echo "Recognized option '-c' with value: ${CRMCQRS}"; shift; CRMCQRS_FLAG="true";; # cqrs case
+			*) shift; echo -e "$(colored "31" "[ WARNING ]") Cannot recognize option: $1"; return 1;; # error case
+		esac # end of case
+	done
+}
+
+function check_errors() {
+	if [ $? -ne 0 ]; then
+		echo -e "$(colored "31" "[ WARNING ]") Errors during BSS binaries deployment"
+		exit 1
+	fi
+}
+
+function check_destination_path() {
+	if [ -f "$1" ]; then
+		echo -e "File $1 exists. Processing deployment."
+		echo -e "Checking integrity of archive - CRC values"
+		unzip -qt $1 
+	else
+		echo -e "$(colored "31" "[ WARNING ]") File $1 does not exist in directory ${PATH_ZIP_FILES}"
+		exit 1
+	fi
+}
+
+function install_component_backend() {
+	if [[ ${BACKEND_FLAG} = "true" ]]; then
+		check_destination_path "${PATH_ZIP_FILES}/${BACKEND}"
+
+		echo "Unzippig archives and configuring backend binaries"
+		unzip -qo "${PATH_ZIP_FILES}/${BACKEND}" -d "."; check_errors
+		mv "${BACKEND%.*}" "bss-backend"; check_errors
+		cp "${BUILDS_DIR}/${NEW_DIR_NAME}/bss-backend/conf/p7.properties.template" "${BUILDS_DIR}/${NEW_DIR_NAME}/bss-backend/conf/p7.properties"
+
+		echo "Adding executable state for bss-backend files"
+		find bss-backend/bin/ bss-backend/scripts/ -maxdepth 1 -type f -exec chmod 764 {} \;
+
+		echo -e "$(colored "32" "[ INFORMATION ]") Backend binaries deployment performed successfully."
+	fi
+}
+
+function install_component_crmcqrs() {
+	if [[ ${CRMCQRS_FLAG} = "true" ]]; then
+		check_destination_path "${PATH_ZIP_FILES}/${CRMCQRS}"
+
+		echo "Unzippig archives and configuring cqrs binaries"
+		unzip -qo "${PATH_ZIP_FILES}/${CRMCQRS}" -d "."; check_errors
+		mv "${CRMCQRS%.*}" "crm-cqrs"; check_errors
+		cp "${BUILDS_DIR}/${NEW_DIR_NAME}/crm-cqrs/conf/p7.properties.template" "${BUILDS_DIR}/${NEW_DIR_NAME}/crm-cqrs/conf/p7.properties"
+
+		echo "Adding executable state for crm-cqrs files"
+		find crm-cqrs/bin/ -maxdepth 1 -type f -exec chmod 764 {} \;
+
+		echo -e "$(colored "32" "[ INFORMATION ]") CQRS binaries deployment performed successfully."
+	fi
+}
+
+function install_component_frontend() {
+	if [[ ${FRONTEND_FLAG} = "true" ]]; then
+		check_destination_path "${PATH_ZIP_FILES}/${FRONTEND}"
+
+		echo "Unzippig archives and configuring frontend binaries"
+		unzip -qo "${PATH_ZIP_FILES}/${FRONTEND}" -d "bss-frontend"; check_errors
+
+		echo "Adding executable state for frontend files"
+		find bss-frontend/instance/bin/ bss-frontend/instance/config/env/ -maxdepth 1 -type f -exec chmod 764 {} \;
+
+		echo -e "$(colored "32" "[ INFORMATION ]") Frontend binaries deployment performed successfully."
+	fi
+}
+
+function fInstallPackage() {
+	for APP_SEARCH in ${BACKEND} ${FRONTEND} ${CQRS}; do
+		if [[ ${APP_SEARCH} ]]; then
+			APPLICATION_NAME=$(echo ${APP_SEARCH%.zip} | sed 's|^[^-]*-||g')
+			PACKAGE_NAME=${APPLICATION_NAME/`echo $APPLICATION_NAME | sed 's|[0-9].*||'`/bss-solution-}
+			break
+		fi
+	done
+
+	if [ `ls ${BUILDS_DIR} | wc -l` -ne 0 ]; then
+		LAST_PACKAGE_NAME=$(ls ${BUILDS_DIR} | grep ^`ls ${BUILDS_DIR} | sed 's/_.*//' | sort -r | head -n 1`)
+		echo "Last package name: $LAST_PACKAGE_NAME"
+	fi
+
+	# suppress errors if BUILD_DIR contains no BSS builds
+	NEW_DIR_NUMBER=$(printf "%03d" `echo $((\`ls -d ${BUILDS_DIR}/[0-9]* 2>/dev/null | xargs -0 -n1 basename 2>/dev/null | sed 's/_.*//' | sort -r | head -n1 | sed 's/^0//' | sed 's/^0//'\`+1))`)
+	NEW_DIR_NAME="${NEW_DIR_NUMBER}""_""${PACKAGE_NAME}"
+	echo "New package name: ${NEW_DIR_NAME}"	
+
+	echo "Creating dir ${BUILDS_DIR}/${NEW_DIR_NAME}"
+	mkdir "${BUILDS_DIR}/${NEW_DIR_NAME}"
+
+	if [ -L "${PATH_ENV}/${SOFTLINK_NAME}" ] && [ -d "${PATH_ENV}/${SOFTLINK_NAME}" ]; then
+		echo "Removing old link '${SOFTLINK_NAME}': ${PATH_ENV}/${SOFTLINK_NAME}"
+		rm -f "${PATH_ENV}/${SOFTLINK_NAME}"
+	fi
+
+	echo "Creating new link '${SOFTLINK_NAME}': ${PATH_ENV}/${SOFTLINK_NAME}"
+	ln -s "${BUILDS_DIR}/${NEW_DIR_NAME}" "${PATH_ENV}/${SOFTLINK_NAME}"
+
+	cd "${BUILDS_DIR}/${NEW_DIR_NAME}"
+	install_component_backend; check_errors
+	install_component_frontend; check_errors
+	install_component_crmcqrs; check_errors
+}
+
+#--------------------------------------------------------------------#
+#------------------------ FUNCTION CALL -----------------------------#
+#--------------------------------------------------------------------#
+
+echo -e "$(colored "32" "[ INFORMATION ]") BSS binaries deployment. Parsing arguments."
+
+if [[ ${@: -1} == '--silent' ]]; then
+	echo -e "$(colored "32" "[ INFORMATION ]") Detected additional 'silent' switch. Processing component deployment on running system."
+	SILENT_DEPLOYMENT='TRUE'; SOFTLINK_NAME='deployment_current'
+	fParseArguments "${@:1:$(($#-1))}" # parse all arguments, except the last one
+else
+	echo -e "$(colored "32" "[ INFORMATION ]") There is no additional switch in script induction. Running default component deployment."
+	SILENT_DEPLOYMENT='FALSE'; SOFTLINK_NAME='current'
+	fParseArguments "$@"
+fi
+
+fInstallPackage
+echo -e "$(colored "32" "[ INFORMATION ]") BSS binaries deployment performed successfully"

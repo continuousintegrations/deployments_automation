@@ -1,0 +1,139 @@
+#!/bin/bash -
+# BS/PI TDP upgrade tool by adam.chalat@comarch.com (based on krzystof.konieczny@comarch.com and krzysztof.gorecki@comarch.com script)
+# script required in directory ${EXT_DIR} file 'packages_bss' with listed liquibases (without extensions) when using bamboo switch
+# package structure: ${package_name}/{pi,bs,om,fdr}
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+source ~/bin/location_finder
+
+BUILD_DATE="04.07.2017r."
+SCRIPT_VERSION="0.0.13"
+
+#--------------------------------------------------------------------#
+#----------------------------- PATH ---------------------------------#
+#--------------------------------------------------------------------#
+
+LIQUIBASE_DIR="${SHOW_DEFAULT_PATH}/liquibase"
+CHANGES_DIR="${LIQUIBASE_DIR}/changes"
+LIQUILOGS="${LIQUIBASE_DIR}/liquiLogs"
+LIQUIBASE_DIRECTORY=Liquibase_installation_`date +%Y-%m-%d`
+EXT_DIR=${CHANGES_DIR}/${LIQUIBASE_DIRECTORY}
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if ([ $1 == 'manual' ] && [ $# -lt 2 ]) || [ $# -lt 1 ]; then
+    echo -e "\nBS/PI TDP upgrade tool by $(colored "32" "adam.chalat@comarch.com")"
+    echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+    echo "This script requires below parameters:"
+    echo "Available parameter [start-up]: bamboo, manual"
+    echo -e "Available parameter [options]: --nodelete (uses extracted directory instead of zip file)\n"
+    echo -e "Usage: $(colored "34" "$(basename $0) manual [liquibase without extension] [options]")"
+    echo -e "Usage: $(colored "34" "$(basename $0) bamboo [options]")\n"
+    echo -e "$(colored "31" "[ WARNING ]") FDR configuration should be placed in ~/bin/servers.arr (key: ${SHOW_ENV_NAME}_FDR_CONFIGURATION)"
+    echo -e "$(colored "31" "[ WARNING ]") FDRs export: fileimporter -e SOURCE_DIRECTORY FILENAME DESTINATION_FILENAME"
+    echo -e "$(colored "31" "[ WARNING ]") FDRs import: fileimporter -i SOURCE_PATH DESTINATION_DIRECTORY\n"
+    exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- PARAMETERS -------------------------------#
+#--------------------------------------------------------------------#
+
+START_UP=$1
+[[ ${START_UP} = 'bamboo' ]] && OPTION=$2 || OPTION=$3
+
+#--------------------------------------------------------------------#
+#-------------------------- FUNCTIONS -------------------------------#
+#--------------------------------------------------------------------#
+
+function unpacking() {
+    echo -e "\n$(colored "32" "[ INFORMATION ]") Starting BS/PI TDP upgrade for changeset $(colored "35" "$1")"
+    if [ "$2" != "--nodelete" ]; then
+        if [ -d ${EXT_DIR}/$1 ]; then
+            echo "Removing previously extracted package: $1"
+            [[ ${EXT_DIR} && $1 ]] && rm -rf ${EXT_DIR}/$1
+        fi
+
+        echo "Unpacking liquibase changesets: $1"
+        unzip -q -d ${EXT_DIR} ${EXT_DIR}/$1.zip
+    fi
+}
+
+function context() {
+	CONTEXT='' # reset value to initial state
+    if find ${EXT_DIR}/$1 -maxdepth 1 -type d -name FDR | read; then
+        echo -e "$(colored "32" "[ INFORMATION ]") Importing FDRs"
+        if [[ `grep ^${SHOW_ENV_NAME}_FDR_CONFIGURATION ~/bin/servers.arr | wc -w` -ne 6 ]]; then
+            echo -e "$(colored "31" "[ WARNING ]") Certain leads to the BS database are empty or incorrect. Please configure connection in ~/bin/servers.arr (key: ${SHOW_ENV_NAME}_FDR_CONFIGURATION)."
+            exit 1
+        else
+            java -jar ${SHOW_DEFAULT_PATH}/liquibase/lib/fileImporter.jar -i ${EXT_DIR}/$1/FDR FDR_BLOBS `grep ^${SHOW_ENV_NAME}_FDR_CONFIGURATION ~/bin/servers.arr | awk '{print $2,$3,$4,$5,$6}'` # arguments, respectively: HOST, PORT, SID, SCHEMA, PASSWORD
+        fi
+    fi
+
+    if find ${EXT_DIR}/$1 -maxdepth 1 -type d -name pi | read; then
+        if find ${EXT_DIR}/$1 -maxdepth 1 -type d -name bs | read; then
+            if find ${EXT_DIR}/$1 -maxdepth 1 -type d -name om | read; then
+                CONTEXT='r2upgrade-context'
+            else
+                CONTEXT='upgrade-context'
+            fi
+        else
+            CONTEXT='pi-upgrade-context'
+        fi
+    elif find ${EXT_DIR}/$1 -maxdepth 1 -type d -name bs | read; then
+        CONTEXT='bs-upgrade-context'
+    fi
+}
+
+function upgrade_bs() {
+    if [[ ${CONTEXT} ]]; then
+    	echo -e "$(colored "32" "[ INFORMATION ]") Detected ${CONTEXT} context. Processing database upgrade."
+        LOG_FILE=${LIQUILOGS}/${LIQUIBASE_DIRECTORY}/${1}_$(date '+%Y%m%d-%H%M%S').log
+        ${LIQUIBASE_DIR}/bin/ant -buildfile ${LIQUIBASE_DIR}/build.xml ${CONTEXT} -Dupgrade.version=$1 -Dcontext=upgrade 2>&1 | tee -a ${LOG_FILE}
+        
+        if grep "BUILD FAILED" ${LOG_FILE}; then
+            echo -e "$(colored "31" "[ WARNING ]") Liquibase $1: BS/PI TDP upgrade completed with errors"
+            exit 1
+        fi
+    fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+mkdir -p ${LIQUILOGS}/${LIQUIBASE_DIRECTORY} # liquibase logs directory (parent directory is created by bss_liquibase)
+if [ "${START_UP}" = 'bamboo' ]; then
+    while read -r line; do
+        trap "[ ${line} -a ${CHANGES_DIR} -a ${EXT_DIR} ] && rm -rf {${CHANGES_DIR},${EXT_DIR}}/${line}" 0 1 2 3 15 # remove softlink and liquibase directory regardless of the result of the upgrade
+        unpacking ${line} $OPTION
+        context ${line}
+        ln -s ${EXT_DIR}/${line} ${CHANGES_DIR}/${line} # create softlink to liquibase due to the indication in the build.xml
+        upgrade_bs ${line}
+        [ -L ${CHANGES_DIR}/${line} ] && rm -f ${CHANGES_DIR}/${line} # check if softlink exists and remove it (trap remove the last one in loop)
+        echo -e "$(colored "32" "[ INFORMATION ]") Liquibase ${line}: BS/PI TDP upgrade completed successfully"
+    done < $EXT_DIR/packages_bss
+elif [ "${START_UP}" = 'manual' ]; then
+    trap "[ $2 -a ${CHANGES_DIR} -a ${EXT_DIR} ] && rm -rf ${CHANGES_DIR}/${2} ${EXT_DIR}/${2}" 0 1 2 3 15 # remove softlink and liquibase directory regardless of the result of the upgrade
+    unpacking $2 $OPTION
+    context $2
+    upgrade_bs $2
+    echo -e "$(colored "32" "[ INFORMATION ]") Liquibase $2: BS/PI TDP upgrade completed successfully"
+fi

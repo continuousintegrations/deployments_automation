@@ -1,0 +1,270 @@
+#!/bin/bash -
+# build_date=24.07.2017
+# ZooKeeper configuration files detection is move directly to ZK_configuration script (files are downloaded from repository or used directly from delivered package)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="Checking_package_for_components"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+#--------------------------------------------------------------------#
+#---------------------------- VARIABLES -----------------------------#
+#--------------------------------------------------------------------#
+
+REPOSITORY=`grep ^ARTIFACTORY_${ENV} ${SERVERS_ARR_FILE} | awk '{print $3}'`
+USER_ART=`grep ^ART_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $2}'`
+PASSWORD_ART=`grep ^ART_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $3}'`
+REPO_PATH=`grep ^ART_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $4}'`
+GIT_PATH=`grep ^GIT_PATH ${SERVERS_ARR_FILE} | awk '{print $2}'`
+GIT_IMPLEMENTATION_DIR=`grep ^GIT_IMPLEMENTATION_DIR ${SERVERS_ARR_FILE} | awk '{print $2}'`
+
+#--------------------------------------------------------------------#
+#-------------------------- FUNCTION CHECK --------------------------#
+#--------------------------------------------------------------------#
+
+function build_implementation_section() {
+	# check separated implementation resources (CI data, ZK file, Liquibases, standalone configuration files)
+	if [[ `grep ^UPDATE_REPOSITORY ${SERVERS_ARR_FILE} | grep ${ENV}` ]]; then
+		GIT_PATH_LIST=$(grep ^GIT_PATH ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}')
+		[[ ${GIT_PATH_LIST} ]] && {
+			echo -e "$(colored "32" "[ INFORMATION ]") Fetching ${GIT_PATH_LIST} remote repository"
+			${LHOME}/${PROJECT}/bin/cron_inductions fetch_remote_repository # synchronise implementation and local repository
+		} || echo -e "$(colored "31" "[ WARNING ]") Upstream repositories fetching is disabled in configuration servers.arr file (key GIT_PATH)"
+
+		fLog "$(colored "34" "[ INFORMATION ]") Processing package synchronisation with upstream GIT (implementation part)"
+		fLog "$(colored "34" "[ INFORMATION ]") Implementation working method is based on: `grep ^IMPLEMENTATION_METHOD ${SERVERS_ARR_FILE} | awk '{print $2}'`"
+		if [[ `grep ^IMPLEMENTATION_METHOD ${SERVERS_ARR_FILE} | awk '{print $2}'` == 'TAGS' ]]; then
+			for repo in ConfigurationImporter Liquibase; do
+				unset 'REPO_ARR'
+				# first column: component name; second: folder name in repository, third: tag for binaries (or master branch), fourth: default path, fifth column: executable script
+				[[ ${repo} = 'ConfigurationImporter' ]] && { declare -a REPO_ARR=("Configuration Importer Data" "configuration-importer-data" `grep ^IMPLEMENTATION_TAGS ${SERVERS_ARR_FILE} | awk '{print $4}'` "${VERSION_DIR}/crm"); }
+				[[ ${repo} = 'Liquibase' ]] && { declare -a REPO_ARR=("Implementation liquibases" "liquibase/${VERSION%.*}" `grep ^IMPLEMENTATION_TAGS ${SERVERS_ARR_FILE} | awk '{print $5}'` "${VERSION_DIR}/crm"); }
+
+				curl -siu ${USER_ART}:${PASSWORD_ART} "http://${REPO_PATH}/${REPOSITORY}/" | grep "<a href=\".*</a>.*-" | sed 's|.*="||g' | sed 's|/".*||g' | sort -V | while read BRANCH; do
+					[[ `awk -F"." '{print $NF}' <<< ${BRANCH}` -le `awk -F"." '{print $(NF-1)}' <<< ${TARGET_VERSION}` ]] && \
+					curl -siu ${USER_ART}:${PASSWORD_ART} "http://${REPO_PATH}/${REPOSITORY}/${BRANCH}/" | grep "<a href=\".*</a>.*-" | sed 's|.*="||g' | sed 's|/".*||g' | sort -V
+				done | sed "/${TARGET_VERSION}/q" | sort -rV | while read REPO_VERSION; do
+					TAG=$(git ls-remote -t --refs ${GIT_PATH} refs/tags/*`eval echo ${REPO_ARR[2]}`* | sed 's|.*/\(.*\)$|\1|' | grep -v '\^' | sort -t. -k1,1nr -k2,2nr -k3,3nr -k4,4nr)
+					if [[ ${TAG} ]]; then
+						fLog "Found tag: $(colored "34" "${TAG}")"
+						cd ${GIT_IMPLEMENTATION_DIR}
+						fLog "Tag commit: $(colored "1;36" "`git show ${TAG} | grep commit | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`")"
+						fLog "Tag author: $(colored "1;36" "`git show ${TAG} | grep Author | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`")"
+						fLog "Tag date: $(colored "1;36" "`git show ${TAG} | grep -w 'Date' | head -n1 | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`")"
+
+						# in first case download binaries corresponding with tag and pathspec, in second download, skipping HEAD folders (tag presence is already checked)
+						[[ ${repo} = 'ConfigurationImporter' ]] && \
+						RESULT=$(git archive --format tar.gz -o ${REPO_ARR[3]}/${VERSION}_${repo}.tar.gz --remote=${GIT_PATH} `eval echo ${REPO_ARR[2]}` ${REPO_ARR[1]} &>/dev/null) || \
+						RESULT=$(git archive --format zip -o ${REPO_ARR[3]}/${repo}-${VERSION}.zip HEAD:liquibase/${TARGET_VERSION%.*} --remote=${GIT_PATH} &>/dev/null)
+
+						if [ $? -ne 0 ]; then
+							fLog "$(colored "31" "[ COMPONENT STATUS ]") ${REPO_ARR[0]} - not delivered. Skipping task execution."
+							rm -f ${REPO_ARR[3]}/${VERSION}_${repo}.tar.gz
+							[[ ${repo} = 'Liquibase' ]] && break # download liquibases corresponding only with current branch
+						else
+							fLog "$(colored "32" "[ COMPONENT STATUS ]") ${REPO_ARR[0]} - successfully downloaded from Git"
+							[[ "${REPO_ARR[4]}" ]] && ${TOSERVERS_PATH}/${REPO_ARR[4]} # execute build script
+							break
+						fi
+					fi
+				done
+			done
+		else
+			PROJECT_BRACH_PATTERN=`grep ^PROJECT_BRACH_PATTERN ${SERVERS_ARR_FILE} | awk '{print $2}'`
+			fLog -n "$(colored "34" "[ INFORMATION ]") Downloading implementation part corresponding with `eval echo ${PROJECT_BRACH_PATTERN}` branch"
+
+			for repo in 'ConfigurationImporter' 'Liquibase'; do
+				[[ ${repo} = 'ConfigurationImporter' ]] && { declare -a REPO_ARR=("Configuration Importer Data" "${VERSION_DIR}/crm/${VERSION}_ConfigurationImporter.tar.gz" "GIT_CONFIGURATION_IMPORTER_REMOTE"); }
+				[[ ${repo} = 'Liquibase' ]] && { declare -a REPO_ARR=("Liquibase" "${VERSION_DIR}/crm/Liquibase-${VERSION}.tar.gz" "GIT_LIQUIBASE_REMOTE"); } 
+
+				fLog -n "Processing download process for ${REPO_ARR[0]}"
+				RESULT=$(git archive --format=tar.gz -o ${REPO_ARR[1]} --remote=`grep ^${REPO_ARR[2]} ${SERVERS_ARR_FILE} | awk '{print $2}'` `eval echo ${PROJECT_BRACH_PATTERN}`)
+
+				[[ $? -ne 0 ]] && \
+				fLog "$(colored "31" "[ WARNING ]") Component for ${repo^^} is not available in `grep ^${REPO_ARR[2]} ${SERVERS_ARR_FILE} | awk '{print $2}'` repository" || \
+				fLog "$(colored "32" "[ INFORMATION ]") Component for ${repo^^} was successfully downloaded from `grep ^${REPO_ARR[2]} ${SERVERS_ARR_FILE} | awk '{print $2}'` repository"
+			done
+		fi
+
+		# iterate inside UPDATE_REPOSITORY key and search for definied directory structure: <environment name>:<folder name> (from this folder is read configuration)
+		while read COLUMN; do
+			WORKING_DIRECTORY=$(grep ${ENV} <<< ${COLUMN} | sed 's|.*:||')
+			[[ ${WORKING_DIRECTORY} ]] && break # break after first occurrence
+		done < <(grep ^UPDATE_REPOSITORY ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i} {print out}}' | tr ' ' '\n')
+
+		[[ -z ${WORKING_DIRECTORY} ]] && {
+			fLog "$(colored "31" "[ WARNING ]") Configuration file servers.arr is corrupted. Key UPDATE_REPOSITORY should be veryfied (required structure: <environment name>:<folder name>)"
+			stop_deployment "Configuration file servers.arr is corrupted (key UPDATE_REPOSITORY)" 
+		}
+
+		${BIN_PATH}/build_package/build_crm_importer_files ${VERSION} ${ENV} ${WORKING_DIRECTORY}
+	else
+		fLog "$(colored "31" "[ WARNING ]") Package synchronisation with GIT repository is disabled (implementation part)"
+	fi
+}
+
+function check_release() {
+	# first column: component location, second: component name, third: task name, fourth: display prompt, fifth: short version for components consisting many different ingredients 
+	bss_liquibase=("${VERSION_DIR}" '.*/bss-db.*.zip' "BS_liquibase_changeset" "BS/PI TDP liquibase" "bss-db-*") # first part of loop
+	crm_liquibase=("${CRM_DIR}" '.*/Liquibase.*\.\(zip\|tar.gz\)' "CRM_liquibase_changeset" "CRM liquibase" "Liquibase-*")
+	dps_binaries=("${VERSION_DIR}" '.*/DPS.*-Linux.*.sh' "DPS_copyextract" "DPS binaries" "DPS*-Linux*")
+	bpc_binaries=("${VERSION_DIR}" '.*/bpc.*\.\(zip\|tar.gz\)' "BPC_copyextract" "BPC binaries" "bpc*")
+	tum_binaries=("${VERSION_DIR}" '.*/tum.*\.\(zip\|sh\)' "TUM_copyextract" "TUM binaries" "tum-restapi-*")
+	aif_binaries=("${VERSION_DIR}" '.*/aif-.*-assembly.*.tar.gz' "AIF_copyextract" "AIF binaries" "aif-*-assembly*")
+	jackrabbit_binaries=("image_store.tar.gz" "JACKRABBIT_copyextract" "JackRabbit image" "1") # second part of loop
+	configuration_importer=("ConfigurationImporterPkg.tar.gz" "Configuration_importer_upgrade" "Configuration Importer" "1")
+	crm_binaries=("logic.tar.gz -o -name presentation.tar.gz -o -name esb.tar.gz -o -name bpm.tar.gz" "CRM_copyextract" "CRM binaries" "4")
+	bpm=("BPMProcessesFiles.tar.gz" "BPMProcessesFiles_import" "BPM definitions") # third part of loop
+	organizations=("Organizations.tar.gz" "Organizations_import" "Organizations")
+	customattributes=("CustomAttributes.tar.gz" "CustomAttributes_import" "CustomAttributes")
+	liferay=("LiferayLayouts.tar.gz" "LiferayLayouts_import" "LiferayLayouts")
+	reports=("ReportsFiles.tar.gz" "ReportsFiles_import" "ReportsFiles")
+	components_array=(bss_liquibase crm_liquibase dps_binaries bpc_binaries tum_binaries aif_binaries zk_configuration jackrabbit_binaries configuration_importer crm_binaries bpm organizations customattributes liferay reports)
+
+	# the keys are accessed using an exclamation point: ${!array[@]}, the values are accessed using ${array[@]}
+	for component_item in ${components_array[@]}; do
+		component_array="${component_item}[@]"
+		array=( "${!component_array}" )
+		if [[ ${component_item} =~ ^(bss_liquibase|crm_liquibase|dps_binaries|bpc_binaries|tum_binaries|aif_binaries)$ ]]; then
+			if [[ `find ${array[0]} -regex ${array[1]} 2>/dev/null | wc -l` -eq 0 ]]; then
+				echo "[ COMPONENT STATUS ] ${array[2]} - skipping task execution" >> ${STEPS_FILE}
+				fLog "$(colored "31" "[ COMPONENT STATUS ]") ${array[3]} - not delivered. Skipping task execution."
+			else
+				echo "[ COMPONENT STATUS ] ${array[3]}:" `find ${array[0]} -maxdepth 1 -type f -regex ${array[1]} -exec basename {} \; | sort -V | tr '\n' ' '` >> ${STEPS_FILE}
+				fLog "$(colored "32" "[ COMPONENT STATUS ]") ${array[3]}: $(colored "34" "`find ${array[0]} -maxdepth 1 -type f -regex ${array[1]} -exec basename {} \; | sort -V | tr '\n' ' '`")"
+			fi
+		elif [[ ${component_item} =~ ^(bpm|organizations|customattributes|liferay|reports)$ ]]; then
+			if [ -f ${CRM_DIR}/${array[0]} ]; then
+				FILE_CHK=$(tar --exclude=.tmp -ztvf ${CRM_DIR}/${array[0]} | wc -l)
+				if ! [ $FILE_CHK -gt 0 ]; then 
+					echo "[ COMPONENT STATUS ] ${array[1]} - skipping task execution" >> ${STEPS_FILE}
+					fLog "$(colored "31" "[ COMPONENT STATUS ]") ${array[2]} - not delivered. Skipping task execution."
+				fi
+			else 
+				echo "[ COMPONENT STATUS ] ${array[1]} - skipping task execution" >> ${STEPS_FILE}
+				fLog "$(colored "31" "[ COMPONENT STATUS ]") ${array[2]} - not delivered. Skipping task execution."
+			fi
+		else
+			if [[ `find ${CRM_DIR} -name ${array[0]} 2>/dev/null | wc -l` -ne ${array[3]} ]]; then
+				echo "[ COMPONENT STATUS ] ${array[1]} - skipping task execution" >> ${STEPS_FILE}
+				fLog "$(colored "31" "[ COMPONENT STATUS ]") ${array[2]} - not delivered. Skipping task execution."
+			fi
+		fi
+	done
+
+	if [ ! -f ${VERSION_DIR}/*-bss-backend-* -o ! -f ${VERSION_DIR}/*-bss-frontend-* ] && [ ! -f ${VERSION_DIR}/bss*rest-api* -o ! -f ${VERSION_DIR}/monitor-launcher* ]; then
+		echo "[ COMPONENT STATUS ] BSS_copyextract - skipping task execution" >> ${STEPS_FILE}
+		echo "[ COMPONENT STATUS ] Data_upgrade - skipping task execution" >> ${STEPS_FILE}
+		echo "[ COMPONENT STATUS ] MBCore_backup - skipping task execution" >> ${STEPS_FILE}
+		echo "[ COMPONENT STATUS ] ES_backup - skipping task execution" >> ${STEPS_FILE}
+		echo "[ COMPONENT STATUS ] ES_starting - skipping task execution" >> ${STEPS_FILE}
+		fLog "$(colored "31" "[ COMPONENT STATUS ]") BSS binaries - not delivered. Skipping task execution."
+		fLog "$(colored "31" "[ COMPONENT STATUS ]") Skipping also: DataUpgrade, MBCore and ES backup."
+		[ ! -f ${VERSION_DIR}/crm-cqrs-* ] && fLog "$(colored "31" "[ COMPONENT STATUS ]") CRM-CQRS - not delivered. Skipping installation of component."
+	else
+		echo "[ COMPONENT STATUS ] BSS backend binaries:" `find ${VERSION_DIR} -maxdepth 1 -type f -regex ".*/.*\(bss.*-rest-api\|-bss-backend-\).*" -exec basename {} \; | sort -V | tr '\n' ' '` >> ${STEPS_FILE}
+		echo "[ COMPONENT STATUS ] BSS frontend binaries:" `find ${VERSION_DIR} -maxdepth 1 -type f -regex ".*/.*\(monitor\|-bss-frontend-\).*" -exec basename {} \; | sort -V | tr '\n' ' '` >> ${STEPS_FILE}
+		[ -f ${VERSION_DIR}/crm-cqrs-* ] && echo "[ COMPONENT STATUS ] BSS cqrs binaries:" `find ${VERSION_DIR} -maxdepth 1 -type f -name "*crm-cqrs-*" -exec basename {} \; | sort -V | tr '\n' ' '` >> ${STEPS_FILE}
+		fLog "$(colored "32" "[ COMPONENT STATUS ]") BSS backend binaries: $(colored "34" "`find ${VERSION_DIR} -maxdepth 1 -type f -regex ".*/.*\(bss.*-rest-api\|-bss-backend-\).*" -exec basename {} \; | sort -V | tr '\n' ' '`")"
+		fLog "$(colored "32" "[ COMPONENT STATUS ]") BSS frontend binaries: $(colored "34" "`find ${VERSION_DIR} -maxdepth 1 -type f -regex ".*/.*\(monitor\|-bss-frontend-\).*" -exec basename {} \; | sort -V | tr '\n' ' '`")"
+		[ -f ${VERSION_DIR}/crm-cqrs-* ] && fLog "$(colored "32" "[ COMPONENT STATUS ]") BSS cqrs binaries: $(colored "34" "`find ${VERSION_DIR} -maxdepth 1 -type f -name "*crm-cqrs-*" -exec basename {} \; | sort -V | tr '\n' ' '`")"
+	fi
+}
+
+function check_git_repository() {
+	cd ${VERSION_DIR}
+	# check offer and businessrequest repository
+	for repo in offer BusinessRequest; do
+		[ ${repo} = 'offer' ] && declare -a REPO_ARR=("Load_and_publish_offer" "Offer" $(eval echo `grep ^IMPLEMENTATION_TAGS ${SERVERS_ARR_FILE} | awk '{print $2}'`)) # first element: step name, second: message, third: tag name
+		[ ${repo} = 'BusinessRequest' ] && declare -a REPO_ARR=("Load_and_publish_BusinessRequest" "Business Request" "`grep ^IMPLEMENTATION_TAGS ${SERVERS_ARR_FILE} | awk '{print $3}'`")
+
+		RESULT=$(git archive --format tar.gz -o ./${VERSION}_${repo}.tar.gz --remote=${GIT_PATH} ${REPO_ARR[2]} ${repo} &>/dev/null)
+		if [ $? -ne 0 ]; then
+			echo "[ COMPONENT STATUS ] ${REPO_ARR[0]} - skipping task execution" >> ${STEPS_FILE}
+			fLog "$(colored "31" "[ COMPONENT STATUS ]") ${REPO_ARR[1]} - not delivered. Skipping task execution."
+			rm -f ${VERSION}_${repo}.tar.gz
+		else
+			mkdir -p ${VERSION_DIR}/${repo}
+			mv ${VERSION}_${repo}.tar.gz ${repo}/
+			echo "[ COMPONENT STATUS ] ${REPO_ARR[1]} - successfully downloaded from Git" >> ${STEPS_FILE}
+			fLog "$(colored "32" "[ COMPONENT STATUS ]") ${REPO_ARR[1]} - successfully downloaded from Git"
+		fi
+	done
+
+	# check bs repository
+	RESULT=$(git archive --format zip -o ./${VERSION}_impl.zip --remote=${GIT_PATH} ${VERSION}_bs bs/resources &>/dev/null)
+	if [ $? -ne 0 ]; then
+		echo "[ COMPONENT STATUS ] IMPL_liquibase_changeset - skipping task execution" >> ${STEPS_FILE}
+		fLog "$(colored "31" "[ COMPONENT STATUS ]") IMPL liquibase changesets - not delivered. Skipping task execution."
+		rm -f ${VERSION}_impl.zip
+	else
+		rm -rf ${VERSION_DIR}/IMPL
+		mkdir -p ${VERSION_DIR}/IMPL
+
+		cd ${VERSION_DIR}/IMPL/
+		RESULT=$(unzip ${VERSION_DIR}/${VERSION}_impl.zip -d ${VERSION_DIR}/IMPL/ &>/dev/null); CODE1=$?
+		RESULT=$(mv bs/resources ${VERSION_DIR}/IMPL/); CODE2=$?
+		RESULT=$(mv resources ${VERSION}_impl); CODE3=$?
+		RESULT=$(zip -r ${VERSION}_impl.zip ${VERSION}_impl &>/dev/null); CODE4=$?
+		rm -rf ${VERSION}_impl bs/ ${VERSION_DIR}/${VERSION}_impl.zip
+
+		if [ $CODE1 -ne 0 -o $CODE2 -ne 0 -o $CODE3 -ne 0 -o $CODE4 -ne 0 ]; then
+			echo -e "$(colored "31" "[ WARNING ]") Something went wrong. Exiting."
+			stop_deployment "Something went wrong during creation of IMPL package"
+		fi
+
+		echo "[ COMPONENT STATUS ] IMPL liquibase changesets - successfully downloaded from Git" >> ${STEPS_FILE}
+		fLog "$(colored "32" "[ COMPONENT STATUS ]") IMPL liquibase changesets - successfully downloaded from Git"
+	fi
+}
+
+function check_ngsf_and_SA() {
+	if [ ! -f ${VERSION_DIR}/${VERSION}-NGSF.tar ]; then
+		echo "[ COMPONENT STATUS ] NGSF_BPM_definitions_import - skipping task execution" >> ${STEPS_FILE}
+		echo "[ COMPONENT STATUS ] NGSF_Release_upgrade - skipping task execution" >> ${STEPS_FILE}
+		fLog "$(colored "31" "[ COMPONENT STATUS ]") NGSF BPM definitions - not delivered. Skipping task execution."
+		fLog "$(colored "31" "[ COMPONENT STATUS ]") NGSF binaries - not delivered. Skipping task execution."
+	else
+		fLog "$(colored "32" "[ COMPONENT STATUS ]") NGSF binaries: $(colored "34" "`find ${VERSION_DIR} -maxdepth 1 -type f -name "*NGSF*" -exec basename {} \; | sort -V | tr '\n' ' '`")"
+	fi
+
+	if [ ! -f ${VERSION_DIR}/${VERSION}-SA.tar ]; then
+		echo "[ COMPONENT STATUS ] SA_release_configuration_upgrade - skipping task execution" >> ${STEPS_FILE}
+		fLog "$(colored "31" "[ COMPONENT STATUS ]") SA binaries - not delivered. Skipping task execution."
+	else
+		fLog "$(colored "32" "[ COMPONENT STATUS ]") SA binaries: $(colored "34" "`find ${VERSION_DIR} -maxdepth 1 -type f -name "*SA*" -exec basename {} \; | sort -V | tr '\n' ' '`")"
+	fi
+}
+
+#--------------------------------------------------------------------#
+#-------------------------- FUNCTIION CALL --------------------------#
+#--------------------------------------------------------------------#
+
+fLog "$(colored "34" "[ INFORMATION ]") Checking $(colored "34" "${VERSION}") release for delivered components" 
+echo `printf '=%.0s' {1..120}` >> ${STEPS_FILE}
+build_implementation_section
+check_release
+check_git_repository
+check_ngsf_and_SA
+echo `printf '=%.0s' {1..120}` >> ${STEPS_FILE}
+
+# move header line in .stp file to the end of file (document transparency) - currently disabled, since check_upgrade_possibility is disabled in build
+# sed -n '1p' ${STEPS_FILE} >> ${STEPS_FILE} && sed -i '1d' ${STEPS_FILE}
+
+source ${BIN_PATH}/common_after

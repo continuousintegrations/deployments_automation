@@ -1,0 +1,222 @@
+#!/bin/bash -
+# DPS control tool by adam.chalat@comarch.com 
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="04.07.2017r."
+SCRIPT_VERSION="0.1.11"
+
+PID_FILE=~/bin/PID_files/$(basename $0).pid
+trap "rm -f -- '$PID_FILE'" EXIT # remove PID file on exit
+
+source ~/bin/location_finder
+[[ $1 == '--version' ]] && { echo $(basename `readlink "${SHOW_DEFAULT_PATH}/admin/$(ls -t ${SHOW_DEFAULT_PATH}/admin | head -n1)/current"`); exit 0; }
+
+DPS_SIDS=`grep ^DPS_SIDS ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'` # all available SID names declared in servers.arr (key: DPS_SIDS)
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nDPS control tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [server]: all, `echo ${DPS_SIDS} | sed 's| |, |g'`" # remove empty strings with commas
+	echo "Available parameter [task]: start, stop, restart, status"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [server] [task] [environment]")\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- PARAMETERS -------------------------------#
+#--------------------------------------------------------------------#
+
+SERVER_NAME=${1,,}
+JOB=${2,,}
+ENV_NAME=${3^^}
+CUR_NAME=${4,,}
+
+PARENT_PID=$$
+NOERROR=`echo "${@: -1}"` # avoid getting errors, when using server_manage (--noerror)
+
+#--------------------------------------------------------------------#
+#----------------------- CHECK PARAMETERS ---------------------------#
+#--------------------------------------------------------------------#
+
+declare -a SERVER_NAME_ARR=("all" ${DPS_SIDS})
+declare -a JOB_ARR=("start" "stop" "restart" "status")
+
+if [[ -z $(echo "${SERVER_NAME_ARR[@]:0}" | grep -w $SERVER_NAME) ]]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong parameter. Please see below"
+	echo -e "$(colored "31" "[ WARNING ]") Available parameters [server]: all, `echo ${DPS_SIDS} | sed 's| |, |g'`\n"
+	exit 1
+elif [[ -z $(echo "${JOB_ARR[@]:0}" | grep -w $JOB) ]]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong parameter. Please see below."
+	echo -e "$(colored "31" "[ WARNING ]") Available parameters [task]: start, stop, restart, status\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------ RESTARTING FUNCTION -----------------------#
+#--------------------------------------------------------------------#
+
+function STOP_SIDS() {
+	DECLARED_SIDS=$(sed 's| |\\\||g' <<< "${DPS_SIDS}")
+	if [[ -z $(ps -fu `whoami` | grep [^]]"${DECLARED_SIDS}" | grep -v grep) ]]; then
+		echo -e "$(colored "32" "[ INFORMATION ]") DPS is $(colored "31" "not working") currently"
+	else
+		cd ${SHOW_DEFAULT_PATH}/versions/`ls -1rv ${SHOW_DEFAULT_PATH}/versions | head -n1`/cbin/
+		if [[ ${SERVER_NAME} = 'all' ]]; then
+			for DPS_SID_NAME in ${DPS_SIDS}; do
+				./dps.sh abort ${DPS_SID_NAME}
+			done
+		else
+			./dps.sh abort ${SERVER_NAME}
+		fi
+
+		echo "Waiting until database will drop entries - 180s"
+		sleep 180
+
+		cd ${SHOW_DEFAULT_PATH}/versions/`ls -1rv ${SHOW_DEFAULT_PATH}/versions | head -n1`/cbin/
+		if [[ ${SERVER_NAME} = 'all' ]]; then # persistent stop check only for all DPS SIDS 
+			for DPS_SID_NAME in ${DPS_SIDS}; do
+				while [ "${RESOURCE_TEST}" != "killed" ]; do
+					./dps.sh status ${DPS_SID_NAME} 2>&1 | grep not | [[ `wc -l` != 0 ]] && RESOURCE_TEST="killed"
+					sleep 10
+					counter=$(($counter+1))
+
+					if [ $counter -eq 6 ];	then # avoid endless loop (4min delay for DPS to stop properly)
+						echo -e "$(colored "31" "[ CRITICAL ERROR ]") ${DPS_SID_NAME} did not stop properly"
+						ps -fu ${USER} | grep dps_manage | grep -v grep | awk '{print $2}' | xargs kill -9
+						exit 1
+					fi
+				done
+			done
+		fi
+	fi
+}
+
+function STOP_PROCESSES() {
+	echo -e "\n$(colored "34" "Stopping DPS components on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+	if [[ -d ${SHOW_DEFAULT_PATH}/versions/`ls -1rv ${SHOW_DEFAULT_PATH}/versions | head -n1`/cbin/ ]]; then
+		[[ $SERVER_NAME =~ ^(all|`echo ${DPS_SIDS} | sed 's\ \|\g'`)$ ]] && STOP_SIDS
+	else
+		echo -e "$(colored "31" "[ WARNING ]") DPS is not installed properly. Skipping procedure."
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- STARTING FUNCTION ------------------------#
+#--------------------------------------------------------------------#
+
+function START_SIDS() {
+	echo -e "$(colored "32" "[ INFORMATION ]") Starting $1 SID"
+	cd ${SHOW_DEFAULT_PATH}/versions/`ls -1rv ${SHOW_DEFAULT_PATH}/versions | head -n1`/cbin/
+	./dps.sh start $1 | sleep 60 | echo
+}
+
+function START_PROCESSES() {
+	echo -e "\n$(colored "34" "Starting DPS components on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+	if [[ -d ${SHOW_DEFAULT_PATH}/versions/`ls -1rv ${SHOW_DEFAULT_PATH}/versions | head -n1`/cbin/ ]]; then
+		if [[ ${SERVER_NAME} = 'all' ]]; then
+			for DPS_SID_NAME in ${DPS_SIDS}; do
+				START_SIDS ${DPS_SID_NAME}
+			done
+		else
+			START_SIDS ${SERVER_NAME}
+		fi
+	else
+		echo -e "$(colored "31" "[ CRITICAL ERROR ]") DPS is not installed properly. Exiting."
+		exit 1
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- STATUS FUNCTION --------------------------#
+#--------------------------------------------------------------------#
+
+function STATUS_PROCESSES() {
+	echo -e "\n$(colored "34" "Testing DPS SIDS on ${IP_ADDRESS} ( ${HOSTNAME} )")"
+	if [[ ${SERVER_NAME} = 'all' ]]; then
+		for DPS_SID_NAME in ${DPS_SIDS}; do
+			STATUS_SIDS ${DPS_SID_NAME}
+		done
+	else
+		STATUS_SIDS ${SERVER_NAME}
+	fi
+
+    # check if DPS has fully started
+    if [[ $ERROR -eq 1 ]]; then
+    	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") DPS has not fully started (one or more required process is not responding)"
+    	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Applications logfiles: ${SHOW_DEFAULT_PATH}/admin/<SID_NAME>/log"
+    	[[ ${NOERROR} != '--noerror' ]] && exit 1 || :
+    fi
+}
+
+function STATUS_SIDS() {
+	cd ${SHOW_DEFAULT_PATH}/versions/`ls -1rv ${SHOW_DEFAULT_PATH}/versions | head -n1`/cbin/ 
+	./dps.sh status $1 2>&1 | grep working &>/dev/null
+
+	if [ "$?" != "0" ]; then
+		echo -e "$(colored "33" "[ WARNING ]") $1 SID is $(colored "31" "not working")"
+		ERROR=1
+	else
+		DPS_SID_PID=$(ps -Af | grep -v grep | grep dps_$1 | awk '{printf "%s ", $2}')
+		for process in $DPS_SID_PID; do
+			stime=`ps -p ${process} -o lstart= | awk '{print $2 $3}'` # start day
+			upwork=`ps -p ${process} -o lstart= | awk '{print $4}'` # start time
+			cpu=`ps -p ${process} -o %cpu= | awk '{print $1}'` # cpu load
+			memory=`ps -p ${process} -o %mem= | awk '{print $1}'` # memory load
+			echo -e "PID: [ $(colored "35" "$(printf "%5d" $process)") ] Stime: [ $(colored "36" "$stime") $(colored "36" "$upwork") ]" \
+			"CPU: [ $(colored "31" "$(printf "%4s" $cpu)") ] PMEM: [ $(colored "33" "$(printf "%4s" $memory)") ] $1 is $(colored "32" "running")"
+		done
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- PRECONDITIONS ----------------------------#
+#--------------------------------------------------------------------#
+
+# check if user links to proper environment
+if [ ${SHOW_ENV_NAME,,} != ${ENV_NAME,,} ]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong environment was definied during script induction."
+	echo -e "$(colored "31" "[ WARNING ]") Current environment: ${SHOW_ENV_NAME^^}. Definied environment: ${ENV_NAME^^}.\n"
+	exit 1
+fi
+
+# check if another process is running in parallel
+if [[ "${JOB}" =~ ^(stop|restart|start)$ ]]; then
+	mkdir -p ~/bin/PID_files # create required folders
+	([[ -f "$PID_FILE" ]] && [[ `cat $PID_FILE` ]]) && echo -e "$(colored "31" "[ WARNING ]") Another process with `cat $PID_FILE` PID is already written to $(basename $0).pid lockfile on ${IP_ADDRESS} ( ${HOSTNAME} )"
+	for CHECK_ANOTHER_PID in $(pidof -x $(basename $0)); do
+		if [ ${CHECK_ANOTHER_PID} != ${PARENT_PID} ]; then
+			echo -e "$(colored "31" "[ WARNING ]") Terminating already running process with ${CHECK_ANOTHER_PID} PID on ${IP_ADDRESS} ( ${HOSTNAME} )"
+			kill -9 ${CHECK_ANOTHER_PID} &>/dev/null # kill silently
+		fi
+	done
+	echo ${PARENT_PID} > "${PID_FILE}"
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTIONS CALL ---------------------------#
+#--------------------------------------------------------------------#
+
+# create tasks list if was definied switch requiring serveral basic tasks
+[[ "${JOB}" == 'restart' ]] && PROCESS_TASK="stop start status" || PROCESS_TASK="${JOB}"
+
+for TASK in ${PROCESS_TASK}; do "${TASK^^}"_PROCESSES; done

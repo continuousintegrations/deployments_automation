@@ -1,0 +1,163 @@
+#!/bin/bash -
+# build_date=18.07.2017
+# shared functions and post execution tasks used by installation mechanisms
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------------- FUNCTIONS -----------------------------#
+#--------------------------------------------------------------------#
+
+function execute_before() {
+	# execute before deployment (send message to slack)
+	[[ ${bamboo_plan_storageTag} ]] && TITLE="Build based on ${VERSION} release has been triggered" || TITLE="Deployment of ${VERSION} release has been started"
+	COLOUR='good'; send_to_slack &>/dev/null
+}
+
+function clean_temporary_deployment_files() {
+	[[ "${SERV[1]}" =~ ^(AIF|TUM)$ ]] && run_remote_command ${SERV[2]} "rm -rf ${RHOME}/zip_files" || :
+	[[ "${SERV[1]}" == "BPC" ]] && run_remote_command ${SERV[2]} "rm -rf ${RHOME}/bpc_binaries" || :
+	[[ "${SERV[1]}" == "CPM" ]] && run_remote_command ${SERV[2]} "rm -rf ${RHOME}/Temp_Install ${RHOME}/servers/{BusinessRequest,zip_files,scripts,offer}" || :
+	[[ "${SERV[1]}" == "CRM" ]] && run_remote_command ${SERV[2]} "rm -rf ${RHOME}/Temp_Install" || :
+	[[ "${SERV[1]}" == "DPS" ]] && run_remote_command ${SERV[2]} "find ~ -maxdepth 1 -mindepth 1 -type f -name \"DPS-*-Linux-*.sh\" -exec rm -f {} \;" || :
+}
+
+function execute_after() {
+	# execute tasks after deployment is finished
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		if [[ "${SERV[0]}" = "${ENV}" ]]; then
+			HOST="${SERV[2]}"; USER="${SERV[4]}"; RHOME="${SERV[5]}"
+			if [[ "${SERV[1]}" = "CRM" ]]; then
+				if [[ `grep ^${ENV}_CONFIGURATION ${SERVERS_ARR_FILE} | awk '{print $3}'` == 'HOT_DEPLOY' ]]; then
+					[[ `grep ^CRM_BACKUP ${SERVERS_ARR_FILE} | grep ${ENV}` ]] && {
+						fLog "Preparing backup of CRM application for ${USER}@${HOST} host"
+						run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/backups_servers; tar -zcf ${RHOME}/backups_servers/crm_binaries_$(date +'%s').tar.gz -C ${RHOME}/deployment_backup ."
+					} || fLog "$(colored "31" "[ WARNING ]") Backup of CRM application is disabled for ${USER}@${HOST} host"
+				fi
+				run_remote_command ${SERV[2]} "rm -rf ${RHOME}/deployment_backup" # remove backuped data
+			elif [[ "${SERV[1]}" = "CPM" ]] && [[ "${SERV[3]}" = "1" ]]; then
+				if grep -q ^"RABBITMQ_TRESHOLD" ${SERVERS_ARR_FILE}; then
+					RESULT=$(scp -pq ${TOSERVERS_PATH}/location_finder ${SERVERS_ARR_FILE} ${TOSERVERS_PATH}/rmq_manage ${USER}@${SERV[2]}:${BIN_DIR} 2>&1)
+					CODE=$?; check_errors 3>&1 1>&2 2>&3 # reverse STDOUT and STDERR
+
+					run_remote_command ${SERV[2]} "rmq_manage all status ${ENV} --counter" # verify queued messages
+					[[ `grep ^PROTECTED_ENVIRONMENTS ${SERVERS_ARR_FILE} | grep ${ENV}` ]] && run_remote_command ${SERV[2]} "rm -f ${BIN_DIR}/rmq_manage" &>/dev/null || :
+				else
+					fLog -n "\n$(colored "31" "[ WARNING ]") Key RABBITMQ_TRESHOLD is not definied in servers.arr configuration file"
+					fLog "$(colored "31" "[ WARNING ]") Skipping queued messages verification on RabbitMQ stack\n"
+				fi
+			fi
+			fLog "Cleaning temporary deployment files on ${USER}@${HOST} host"
+			clean_temporary_deployment_files
+		fi
+	done
+}
+
+function check_deployment_logfile() {
+	if [[ ${bamboo_plan_storageTag} ]] && [[ ${bamboo_shortJobKey} ]] && [[ ${bamboo_buildNumber} ]]; then
+		# parameters defined during generating build
+		NEWEST_LOGFILE="${bamboo_plan_storageTag}-${bamboo_shortJobKey}-${bamboo_buildNumber}.log"
+		WORKING_DIRECTORY="${NEWEST_LOGFILE%-*}"
+	else
+		# parameters defined during deployment
+		WORKING_DIRECTORY="${bamboo_build_working_directory##*/}"
+		NEWEST_LOGFILE=`ls -t ${BAMBOO_BUILD_XML}/${WORKING_DIRECTORY}/download-data/build_logs/ | head -n1` # get newest logfile
+	fi
+
+	SEARCH_PATTERN='error|warning|file not found|no such file or directory'
+	fLog "Searching for undesirable content in ${NEWEST_LOGFILE} logfile"
+	if grep -iE "${SEARCH_PATTERN}" ${BAMBOO_BUILD_XML}/${WORKING_DIRECTORY}/download-data/build_logs/${NEWEST_LOGFILE} | grep -vi 'No errors\|Running command' | grep -qiE "${SEARCH_PATTERN}"; then
+		fLog "$(colored "31" "[ WARNING ]") Found messages containing substance, that requires user analysis\n"
+		# switch E (interpret PATTERN as an extended regular expression), switch i (ignore case distinctions) - exclude from printout application timestamps
+		grep -iE "${SEARCH_PATTERN}" ${BAMBOO_BUILD_XML}/${WORKING_DIRECTORY}/download-data/build_logs/${NEWEST_LOGFILE} | grep -vi 'No errors\|Running command' | \
+		awk '{out=$4; for(i=5;i<=NF;i++){out=out" "$i}; print out}' | sed -r "s/\x1B\[([0-9]{1,3}((;[0-9]{1,3})*)?)?[m|K]//g"
+		[[ `grep ^ERROR_PRIORITY ${SERVERS_ARR_FILE} | grep ${ENV}` ]] && stop_deployment "Deployment logfile contains undesirable content" || :
+	else
+		fLog "$(colored "32" "[ INFORMATION ]") Deployment logs do not include undesirable content"
+	fi
+}
+
+function generate_raport() {
+	if [[ ${bamboo_plan_storageTag} ]]; then
+		TITLE="Build based on ${VERSION} release has been prepared successfully"; COLOUR='good'; send_to_slack &>/dev/null # send message to slack
+	else
+		# generate deployment report
+		grep 'elapsed' ${STEPS_FILE} | awk '{print $2}' | echo -e "`printf '=%.0s' {1..120}`" "\nTotal deployment time: `awk '{s+=$1} END {print s}'`s" >> ${STEPS_FILE}
+		echo "Deployment started at: `grep 'seconds elapsed' ${STEPS_FILE} | head -n1 | cut -d"[" -f1-3 | sed 's|\[||g' | sed 's|\]| |g'`" >> ${STEPS_FILE}
+		echo -e "Deployment finished at: `date +"%F %H:%M:%S"`\n""`printf '=%.0s' {1..120}`" >> ${STEPS_FILE}
+		cat ${STEPS_FILE} # display summary of deployment in bamboo window
+
+		TITLE="Deployment of ${VERSION} release finished successfully"; COLOUR='good'; send_to_slack &>/dev/null
+	fi
+}
+
+function remove_temporary_directory() {
+	# remove temporary directory used during deployment (downloaded from repository)
+	fLog "$(colored "32" "[ INFORMATION ]") Cleaning temporary directory for ${ENV} environment. Version: ${VERSION}."
+	[[ ${VERSION_DIR} ]] && rm -rf ${VERSION_DIR} || stop_deployment "Aborting deployment, because of lacking \${VERSION_DIR} variable"
+
+	if ! grep -q 'Deployment\ finished\ at' ${STEPS_FILE} 2>/dev/null; then
+		# situation when error was not handled or deployment was aborted by user
+		TITLE="Deployment of ${VERSION} release finished with errors on ${ENV} environment"
+		MESSAGE="Final task (missing confirmation of the completion of the installation)\nLogs have to be checked manually (installation was aborted or ended with not handled error)"
+		COLOUR='danger'; send_to_slack &>/dev/null
+	fi
+}
+
+function update_version_string() {
+	fLog "$(colored "32" "[ INFORMATION ]") Updating version string for deployment plan: ${bamboo_deploy_release}"
+	fLog "File source: ${BAMBOO_BUILD_XML}/../build-dir/${bamboo_buildKey}/trigger_deployment"
+	echo release=${bamboo_deploy_release} > ${BAMBOO_BUILD_XML}/../build-dir/${bamboo_buildKey}/trigger_deployment
+}
+
+function deployment_task() {
+	# execute after each deployment task (if no parameters are given)
+	echo -e `eval ${TIME_STAMP}`"[$(printf "%' '6d" $SECONDS) seconds elapsed]" ${STEP_NAME} >> ${STEPS_FILE} # export STEP_NAME after successful task execution with time elapsed
+
+	# check if pause index is inserted into stp file
+	if grep 'pause' ${STEPS_FILE}; then
+		echo -e "$(colored "31" "[ DEPLOYMENT SUSPENSION ]") String 'pause' is detected in `basename ${STEPS_FILE}` logfile. Installation is suspended with interval check equal 120s."
+		echo -e "$(colored "31" "[ DEPLOYMENT SUSPENSION ]") Deployment process will be suspended until 'pause' string is not removed from `basename ${STEPS_FILE}` logfile."
+		while [[ `grep 'pause' ${STEPS_FILE}` ]]; do sleep 120; done
+	fi
+}
+
+#--------------------------------------------------------------------#
+#-------------------------- PRECONDITIONS ---------------------------#
+#--------------------------------------------------------------------#
+
+# prerequisites - check presence of critical deploy arguments (only when starting deployment)
+# WARNING: remember, that missing arguments are casuing problems with 'Final tasks'
+for CHECK_ARGS in "$@" ; do
+	if [[ ${CHECK_ARGS} == 'execute_before' ]] ; then
+		if [[ -z ${bamboo_deploy_release} ]] || [[ -z ${bamboo_deploy_environment} ]]; then
+			echo -e "\e[31m[ CRITICAL ERROR ]\e[0m Deployment was started incorrectly - missing \${bamboo_deploy_environment} or \${bamboo_deploy_release} parameter"
+			echo -e "\e[31m[ CRITICAL ERROR ]\e[0m Please run build with option 'Run customised...' or correct scripts inductions"
+			exit 1
+		fi
+	fi
+done
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTIONS CALL ---------------------------#
+#--------------------------------------------------------------------#
+
+if ([[ $# -eq 3 ]] && [[ "${BASH_SOURCE[0]}" == "${0}" ]]) || [[ $3 == 'execute_before' ]]; then # check if script is not a source
+	source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+	# functions must be inducted with three parameters, because they are run in separated shells (first argument - function name, second - version name, third - environment name)
+	${VARIABLE} ${VERSION} ${ENV} # script should be inducted externally through arguments: ${bamboo.deploy.release} ${bamboo.deploy.environment} ${function.name}
+	[[ `grep ^ERROR_PRIORITY ${SERVERS_ARR_FILE} | grep ${ENV}` ]] && check_deployment_logfile || :
+else
+	deployment_task
+	[[ `grep ^ERROR_PRIORITY ${SERVERS_ARR_FILE} | grep ${ENV}` ]] && check_deployment_logfile || :
+fi

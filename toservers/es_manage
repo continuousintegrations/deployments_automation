@@ -1,0 +1,512 @@
+#!/bin/bash -
+# ElasticSearch control tool by adam.chalat@comarch.com
+# WARNING: configuration network.host (or network.bind_host and network.publish_host) key should be declared (Elasticsearch, by default, binds itself to the 0.0.0.0 address)
+# set the number of active modes - function REMOTE_ES (currently ElasticSearch is started only on CPM and QUORUM nodes - three instances with only one main number in servers.arr <fourth column>)
+# static job argument is set for remote indications to avoid collision with tasks, which should be run from main node
+# script supports parallel handling of mutiple clustered instances of ElasticSearch (required by BSS and BPC)
+# BSS's elasticsearch has to be put in <local path>/servers/ES/elasticsearch_<cluster number>/ and for BPC in <local path>/servers/ES/elasticsearch_<cluster number>_bpc/ location
+# performance monitoring is executed by running script with additional '--performance' switch which requires 'jq' command to parse JSON (for multiple nodes monitoring is executed only on induction node)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="10.07.2017r."
+SCRIPT_VERSION="0.3.25"
+
+PID_FILE=~/bin/PID_files/$(basename $0).pid
+CURRENT_USER=${USER}
+
+trap "rm -f -- '$PID_FILE'" EXIT # remove PID file on exit
+
+source ~/bin/location_finder
+
+#--------------------------------------------------------------------#
+#------------------------- PARAMETERS -------------------------------#
+#--------------------------------------------------------------------#
+
+ES_INSTACE=${1,,}
+JOB=${2,,}
+ENV_NAME=${3^^}
+CUR_NAME=${4,,}
+
+SCRIPT_ARGUMENTS="$@"
+PARENT_PID=$$
+NOERROR=`echo "${@: -1}"` # avoid getting errors, when using server_manage (--noerror)
+
+#--------------------------------------------------------------------#
+#------------------------ PATHS AND VARIABLES -----------------------#
+#--------------------------------------------------------------------#
+
+ES_PATH=${SHOW_DEFAULT_PATH}/servers/ES/elasticsearch_
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/es_manage
+SERVERS_ARRAY_FILE=~/bin/servers.arr
+
+ES_USER=$(grep -w ^"${SHOW_ENV_NAME}_ES" ${SERVERS_ARRAY_FILE} | awk '{print $3}')
+ES_PASSWORD=$(grep -w ^"${SHOW_ENV_NAME}_ES" ${SERVERS_ARRAY_FILE} | awk '{print $4}')
+
+ERROR=0; MONITOR_ANALYZER_ERROR=0 # reset to original state (used during status check)
+STORAGE_USED=$(df -hP ${SHOW_DEFAULT_PATH} | tail -n1 | awk '{print $5}' | sed 's|[^0-9]*||g')
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nElasticSearch control tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [instance]: all, bss, bpc"
+	echo "Available parameter [task]: backup, start, status, stop, reconstruction, restart"
+	echo "Available parameter [environment]: `grep ^ENV_LIST ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`"
+	echo -e "Available parameter [options]: current (optional - only for current node), --performance (cluster monitoring)\n"
+	echo -e "$(colored "31" "[ WARNING ]") Script requires updated configuration files: location.finder and servers.arr"
+	echo -e "$(colored "31" "[ WARNING ]") Backup - applies only the incremental method (version 7.2 and below)\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [instance] [task] [environment] [options]")\n"
+	exit 1
+fi
+
+[[ ! ${ES_INSTACE} =~ ^(all|bpc|bss)$ ]] && {
+	echo -e "\n$(colored "31" "[ WARNING ]") ElasticSearch's instance was not set properly by user (see script's manual). Using default parameters."
+	ES_INSTACE=ALL # default ElasticSearch instance (supported also BSS and BPC)
+}
+
+#--------------------------------------------------------------------#
+#----------------------- CHECK PARAMETERS ---------------------------#
+#--------------------------------------------------------------------#
+
+declare -a ES_INSTACE_ARR=("all" "bpc" "bss")
+declare -a JOB_ARR=("backup" "start" "status" "stop" "reconstruction" "restart")
+
+if [[ -z $(echo "${ES_INSTACE_ARR[@]:0}" | grep -w $ES_INSTACE) ]]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong parameter. Please see below"
+	echo -e "$(colored "31" "[ WARNING ]") Available parameters [server]: all, bpc, bss\n"
+	exit 1
+elif [[ -z $(echo "${JOB_ARR[@]:0}" | grep -w ${JOB}) ]]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong parameter. Please see below."
+	echo -e "$(colored "31" "[ WARNING ]") Available parameters [task]: backup, start, status, stop, reconstruction, restart\n"
+	exit 1
+elif [[ -z ${ES_USER} ]] || [[ -z ${ES_PASSWORD} ]]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Missing ElasticSearch's credentials (username or password for read access)"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------ STOPPING FUNCTION -------------------------#
+#--------------------------------------------------------------------#
+
+function STOP_ES() {
+	echo -e "\n$(colored "34" "[ INFORMATION ]") Stopping ElasticSearch cluster on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+
+	if [ -z $(GET_ES_PROC) ]; then
+		echo -e "ElasticSearch $(colored "31" "is not running"). Cannot kill dead one."
+	else
+		kill $(GET_ES_PROC)
+		if [ -n "`ps -A | grep $(GET_ES_PROC)`" ]; then
+			echo "ElasticSearch is flushing. Do not force kill."
+			RESULT=1; counter=1
+			until [ $RESULT = 0 ]; do
+				CHECK_ES_PROCESS=$(GET_ES_PROC); RESULT=$?
+				echo "Waiting until flushing of ElasticSearch will be finished -" $((15*$counter))"sec"
+				sleep 15
+				counter=$(($counter+1))
+			done
+		fi
+		echo -e "$(colored "32" "[ INFORMATION ]") ElasticSearch was $(colored "31" "switched off") successfully"
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------ STARTING FUNCTION -------------------------#
+#--------------------------------------------------------------------#
+
+function START_ES() {
+	if [[ ! -z $(GET_ES_PROC) ]]; then
+		echo -e "$(colored "32" "[ INFORMATION ]") ElasticSearch is already running with PID: $(colored "34" "$(GET_ES_PROC)") on ${IP_ADDRESS} ( ${HOSTNAME} )"
+	else
+		echo -e "\n$(colored "34" "[ INFORMATION ]") Starting ElasticSearch cluster on $(colored "34" "${IP_ADDRESS} ( ${HOSTNAME} )")"
+		${SHOW_DEFAULT_PATH}/servers/ES/elasticsearch_${ES_ITER}/bin/elasticsearch -d
+		sleep 10
+
+		if [[ $(GET_ES_PROC) ]]; then
+			echo -e "$(colored "32" "[ INFORMATION ]") ElasticSearch's instance $(colored "32" "is running") with PID: $(colored "34" "$(GET_ES_PROC)")"
+		else
+			echo -e "$(colored "31" "[ WARNING ]") ElasticSearch's instance $(colored "31" "is not running"). Please contact ITOPS department."; 
+			echo -e "$(colored "31" "[ WARNING ]") Application logfiles: ${SHOW_DEFAULT_PATH}/servers/ES/elasticsearch_${ES_ITER}/logs"
+			exit 1
+		fi
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- STATUS FUNCTION --------------------------#
+#--------------------------------------------------------------------#
+
+function STATUS_ES() {
+	CLUSTER_NAME=$(grep ^cluster.name ${SHOW_DEFAULT_PATH}/servers/ES/elasticsearch_${ES_ITER}/config/elasticsearch.yml | cut -d":" -f2 | sed 's|[[:space:]]||g')
+	# wait for 90 seconds for the cluster to reach the yellow level (https://www.elastic.co/guide/en/elasticsearch/reference/1.7/cluster-health.html) -> _cluster/health?wait_for_status=yellow&timeout=50s
+	ES_STATUS=`curl --user ${ES_USER}:${ES_PASSWORD} --max-time 10 --retry 3 -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}/_cluster/health | awk -F"," '{ print $2 }' | awk -F ":" '{ print $2 }' | sed 's/"//g'`
+
+	echo -e "\n$(colored "34" "Cluster health of ${ES_MULTI_CLUSTER^^} ElasticSearch on ${IP_ADDRESS} ( ${HOSTNAME} ) - ${ES_HTTP_PORT} HTTP port")"
+	echo -e "ElasticSearch directory: ${SHOW_DEFAULT_PATH}/servers/ES/elasticsearch_${ES_ITER}"
+	if [ -z $(GET_ES_PROC) ]; then
+		echo -e "Instance ${CLUSTER_NAME^^} $(colored "31" "is not running"). Cluster health: $(colored "31" "red")"
+		exit 1
+	elif [[ ${ES_STATUS} =~ ^(red|yellow|green)$ ]]; then
+		stime=`ps -p $(GET_ES_PROC) -o lstart= | awk '{print $2 $3}'` # start day
+		upwork=`ps -p $(GET_ES_PROC) -o lstart= | awk '{print $4}'` # start time
+		cpu=`ps -p $(GET_ES_PROC) -o %cpu= | awk '{print $1}'` # cpu load
+		memory=`ps -p $(GET_ES_PROC) -o %mem= | awk '{print $1}'` # memory load
+
+		STATUS_STATEMENT=`echo PID: [ $(colored "35" "$(printf "%5d" $(GET_ES_PROC))") ] Stime: [ $(colored "36" "$stime") $(colored "36" "$upwork") ] \
+		CPU: [ $(colored "31" "$(printf "%4s" $cpu)") ] PMEM: [ $(colored "33" "$(printf "%4s" $memory)") ] Instance ${CLUSTER_NAME^^} $(colored "32" "is running").`
+
+		[[ ${ES_STATUS} == 'green' ]] && echo -e "${STATUS_STATEMENT} Cluster health: $(colored "32" "${ES_STATUS}").\n"
+		[[ ${ES_STATUS} == 'yellow' ]] && echo -e "${STATUS_STATEMENT} Cluster health: $(colored "33" "${ES_STATUS}").\n"
+		[[ ${ES_STATUS} == 'red' ]] && echo -e "${STATUS_STATEMENT} Cluster health: $(colored "31" "${ES_STATUS}").\n"
+
+		CLUSTER_HEALTH
+
+		if [[ $(echo "${SCRIPT_ARGUMENTS}" | grep -w '\-\-performance') ]]; then
+			if type "jq" > /dev/null; then
+				echo -e "\n$(colored "32" "[ INFORMATION ]") ElasticSearch cluster performance analyzer"
+				ES_DOCS_COUNTER=$(curl --user ${ES_USER}:${ES_PASSWORD} --max-time 10 --retry 3 -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_cluster/stats?human&pretty' | jq '.indices | .count')
+				echo -e "$(colored "33" "[ DEBUGGER ]")" `curl --user ${ES_USER}:${ES_PASSWORD} --max-time 10 --retry 3 -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_cluster/stats?human&pretty' | \
+				jq '.indices | .docs | .count,.deleted' | tr '\n' ':' | \
+				awk -v var="${ES_DOCS_COUNTER}" -F":" 'BEGIN{printf "Cluster stores "} {print $1, "documents relocated in "'"var"'" indices (already" ,$2, "items have been deleted)"}'`
+
+				[[ `curl --user user:Passw0rd -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_nodes/pending_tasks' | jq '.nodes|.tasks'` == 'null' ]] && \
+				echo -e "$(colored "33" "[ DEBUGGER ]") ElasticSearch has no pending cluster tasks (e.g. create index, update mapping, allocate or fail shard)" || {
+					echo -e "$(colored "33" "[ DEBUGGER ]") ElasticSearch's pending cluster tasks"
+					curl --user user:Passw0rd -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_nodes/pending_tasks'
+					MONITOR_ANALYZER_ERROR=1
+				}
+
+				CLUSTER_NODE_NAME=$(curl --user user:Passw0rd -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_nodes/stats/os?human&pretty' | \
+				jq '.nodes | .[] | select(.host == '"\"${IP_ADDRESS}\""') | .name' | tr -d "\"") 
+
+				FREE_SWAP_SPACE=$(curl --user ${ES_USER}:${ES_PASSWORD} --max-time 10 --retry 3 -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_nodes/stats/os?human&pretty' | \
+				jq '.nodes | .[] | select(.name == '"\"${CLUSTER_NODE_NAME}\""') | .os.swap.free_in_bytes')
+
+				echo -e "$(colored "33" "[ DEBUGGER ]")" `curl --user user:Passw0rd -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_nodes/stats/os?human&pretty' | \
+				jq '.nodes | .[] | select(.name == '"\"${CLUSTER_NODE_NAME}\""') | .os | .mem |.free_percent,.free_in_bytes' | sed 's|[^0-9]*||g' | tr '\n' ':' | \
+				awk -v var="${FREE_SWAP_SPACE}" -F":" 'BEGIN{printf "Operating system has "} {print $1, "percent of free memory (" $2, "bytes in total) and "'"var"'" bytes of free system swap"}'`
+
+				[[ `curl --user ${ES_USER}:${ES_PASSWORD} --max-time 10 --retry 3 -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'_cat/indices' | grep -c '^yell\|red'` -eq 0 ]] && \
+				echo -e "$(colored "33" "[ DEBUGGER ]") ElasticSearch has no indices in yellow or red state" || {
+					echo -e "$(colored "31" "[ DEBUGGER ]") ElasticSearch's indicies in yellow and red state"
+					curl --user user:Passw0rd -s 'http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'_cat/indices | grep -c '^yell\|red'
+					MONITOR_ANALYZER_ERROR=1
+				}
+
+				echo -e "$(colored "33" "[ DEBUGGER ]")" `curl --user user:Passw0rd -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_nodes/stats?human&pretty' | \
+				jq '. | .nodes | .[] | select(.name == '"\"${CLUSTER_NODE_NAME}\""') | .indices.store.size_in_bytes, .indices.indexing.index_time_in_millis' | \
+				tr '\n' ':' | awk -F":" 'BEGIN{printf "Stored indices use "} {print $1, "bytes of disk space (total indexing time took", $2, "milliseconds)"}'`
+
+				[[ `curl --user user:Passw0rd -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_cat/shards' | awk '$4 !~ /STARTED/ {print}' | wc -l` -ne 0 ]] && {
+					echo -e "$(colored "31" "[ DEBUGGER ]") ElasticSearch has unassigned shards (possible reasons: ALLOCATION_FAILED, INDEX_CREATED, NODE_LEFT, REINITIALIZED etc.)"
+					curl --user user:Passw0rd -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_cat/shards' | awk '$4 !~ /STARTED/ {print}'
+					MONITOR_ANALYZER_ERROR=1
+				} || { echo -e "$(colored "33" "[ DEBUGGER ]") All shards in cluster are in STARTED state"; }
+
+				echo -e "$(colored "33" "[ DEBUGGER ]") Instances belonging to cluster with listed respectively: IP address, port, HEAP percent and node name"
+				curl --user user:Passw0rd -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_cat/nodes?h=ip,port,heapPercent,name'
+
+				echo -e "$(colored "33" "[ DEBUGGER ]") Top 10 of largest index by disk usage not including replicas"
+				curl --user user:Passw0rd -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}/'_cat/indices?bytes=b' | sort -rnk8 | head -n10
+
+				echo -e "$(colored "33" "[ DEBUGGER ]") Top 10 of memory consumption per index"
+				curl --user user:Passw0rd -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}'/_cat/indices?v&h=i,tm' | sort -rnk2 | head -n10
+
+				echo -e "$(colored "34" "[ INFORMATION ]") ElasticSearch cluster performance analyzer has finished all tasks"
+			else
+				echo -e "\n$(colored "31" "[ WARNING ]") Performance analyzer for ElasticSearch is disabled, because of lacking 'jq' command"
+			fi
+		fi
+	else
+		echo -e "$(colored "31" "[ WARNING ]") Cluster health is unavailable - API request returned not matching string"
+	fi
+}
+
+function CLUSTER_HEALTH() {
+	ES_HTTP_ADDRESS=$(curl --user ${ES_USER}:${ES_PASSWORD} --max-time 10 --retry 3 -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}/_cluster/health)
+	echo `awk -F"," '{ print $7 }' <<< ${ES_HTTP_ADDRESS} | awk -F ":" '{ print $1 ": " $2 }' | sed 's/"//g' | sed 's/.*/\u&/'`
+	echo `awk -F"," '{ print $8 }' <<< ${ES_HTTP_ADDRESS} | awk -F ":" '{ print $1 ": " $2 }' | sed 's/"//g' | sed 's/.*/\u&/'`
+	echo `awk -F"," '{ print $9 }' <<< ${ES_HTTP_ADDRESS} | awk -F ":" '{ print $1 ": " $2 }' | sed 's/"//g' | sed 's/.*/\u&/'`
+	echo `awk -F"," '{ print $10 }' <<< ${ES_HTTP_ADDRESS} | awk -F ":" '{ print $1 ": " $2 }' | sed 's/"//g' | sed 's/}//g' | sed 's/.*/\u&/'`
+}
+
+#--------------------------------------------------------------------#
+#---------------------------- SHARED ES -----------------------------#
+#--------------------------------------------------------------------#
+
+function shared_resources() {
+	if [ `curl --user ${ES_USER}:${ES_PASSWORD} -s -XGET 'http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}/_snapshot/es_backup_daily?pretty' | grep RepositoryMissingException | wc -l` -ne 0 ]; then # '-s' switch to hide curl output
+		echo -e "$(colored "31" "[ ERROR ]") Daily repository has not been created yet"
+		echo -e "$(colored "31" "[ ERROR ]") Add entry to elasticsearch.yml file: path.repo: ["/\${SHARED-PATH}/es_backup/daily"]"
+		echo -e "$(colored "31" "[ ERROR ]") Use the following: curl -XPUT \"http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}/_snapshot/es_backup_daily\" -d '{ "type": "fs", "settings": { "location": "/\${SHARED-PATH}/es_backup/daily", "compress": true }}'"
+		exit 1
+	else
+		curl -XPUT "http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}/_snapshot/es_backup_daily/snapshot_`date +%Y%m%d%H%M`?wait_for_completion=true" > ${ES_PATH}${ES_ITER}/es_backup_log
+
+		( awk -F"\"state\":" '{ print $2 }' | awk -F",\"" '{ print $1 }' | echo State: `sed 's/"//g'` | if ! grep SUCCESS; then exit 1; fi ) < ${ES_PATH}${ES_ITER}/es_backup_log; CODE1=$?
+		( awk -F"\"shards\":" '{ print $2 }' | awk -F":" '{ print $3 }' | awk -F",\"" '{ print "Failed shards: "$1 }' | if ! grep 0; then exit 1; fi ) < ${ES_PATH}${ES_ITER}/es_backup_log; CODE2=$?
+		if [[ $CODE1 = '0' ]] && [[ $CODE2 = '0' ]]; then
+			( awk -F"\"shards\":" '{ print $2 }' | awk -F":" '{ print $2 }' | awk -F",\"" '{ print "Total shards: "$1 }' ) < ${ES_PATH}${ES_ITER}/es_backup_log
+			( awk -F"\"shards\":" '{ print $2 }' | awk -F":" '{ print $4 }' | awk -F",\"" '{ print $1 }' | echo Successful shards: `sed 's/}//g'` ) < ${ES_PATH}${ES_ITER}/es_backup_log
+		else
+			echo -e "$(colored "31" "[ WARNING ]") Backup of ElasticSearch was unsuccessfuly performed"
+			exit 1
+		fi
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------ ES RECONSTRUCTION -------------------------#
+#--------------------------------------------------------------------#
+
+function es_reconstruction() {
+	if [ $1 == 'data_remove' ]; then
+		echo "Removing data from directory: ${ES_PATH}${ES_ITER}/data ( machine address: ${IP_ADDRESS} )"
+		rm -r ${ES_PATH}${ES_ITER}/data/*
+	elif [ $1 == 'recreate_repo' ]; then
+		curl -XPUT "http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}/_snapshot/es_backup_hourly" -d '{ "type": "fs", "settings": { "compress": "true", "location": "${ES_DIR}/MFT/es_backup/hourly" } }'
+		curl -XPUT "http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}/_snapshot/es_backup_daily" -d '{ "type": "fs", "settings": { "compress": "true", "location": "${ES_DIR}/MFT/es_backup/daily" } }'
+
+		${SHOW_DEFAULT_PATH}/servers/launcher/current/bss-backend/scripts/reindex.sh snapshots
+		${SHOW_DEFAULT_PATH}/servers/launcher/current/bss-backend/scripts/reindex.sh all
+	fi
+}
+
+#--------------------------------------------------------------------#
+#---------------------------- ES PROCESS ----------------------------#
+#--------------------------------------------------------------------#
+
+# get process of elasticsearch's instance
+function GET_ES_PROC() { echo `ps -fu ${USER} | grep -P "(?=.*java)(?=.*elasticsearch.*_${ES_ITER}/)" | grep -vi grep | awk '{print $2}'`; }
+
+# check if script is inducted externally or is run as parent process
+function check_parent_induction() { [[ `grep 'run_externally' <<< "${@}"` ]]; echo $?; }
+
+function gather_ES_HTTP_PORT() {
+	# gathering informations from ElasticSearch's config
+	ES_HTTP_PORT=$(grep ^http.port `find ${SHOW_DEFAULT_PATH}/servers/ES/elasticsearch_${ES_ITER}/config -name "elasticsearch.yml"` | head -n1 | awk -F: '{print $NF}' | awk '$1 ~ /[0-9]+$/ {print $1}')
+
+	if [[ -z ${ES_HTTP_PORT} ]]; then
+		for ES_CONF_FILE in $(find ${SHOW_DEFAULT_PATH}/servers/ES/elasticsearch_*`echo ${ES_ITER} | sed 's|[!^0-9]||g'`* -name "elasticsearch.yml"); do
+			ES_HTTP_PORT=$(grep ^http.port ${ES_CONF_FILE} | awk -F: '{print $NF}' | awk '$1 ~ /[0-9]+$/ {print $1}')
+			[[ ${ES_HTTP_PORT} ]] && break
+		done
+	fi
+	[[ ! ${ES_HTTP_PORT} =~ ^[0-9]+$ ]] && { echo -e "$(colored "31" "[ CRITICAL ERROR ]") Mismatch during gathering informations from ElasticSearch's config"; exit 1; }
+
+	SEARCH_BIND_HOST=$(grep "^network.host\|^network.bind_host" "${SHOW_DEFAULT_PATH}/servers/ES/elasticsearch_${ES_ITER}/config/elasticsearch.yml" | head -n1 | cut -d":" -f2 | tr -d '[:space:]')
+	[[ -z ${SEARCH_BIND_HOST} ]] && {
+		echo -e "\n$(colored "31" "[ WARNING ]") Key network.host for ${ES_MULTI_CLUSTER^^} cluster is not set on ${IP_ADDRESS} (file: elasticsearch_${ES_ITER}/config/elasticsearch.yml)"
+		echo -e "$(colored "31" "[ WARNING ]") ElasticSearch's instances should be binded to proper target (listening ElasticSearch on 0.0.0.0 address)"
+		SEARCH_BIND_HOST='0.0.0.0'
+	}
+}
+
+function execute_task() {
+	([[ "${IP_ADDRESS}" == "${LOCAL_HOST}" ]] && [[ ${REMOTE_HOST} != '0' ]] && [[ ${CUR_NAME} != 'current' ]]) && REMOTE_ES ${ES_MULTI_CLUSTER} $1
+	$2 # call function
+}
+
+#--------------------------------------------------------------------#
+#-------------------------- REMOTE HOSTS ----------------------------#
+#--------------------------------------------------------------------#
+
+function REMOTE_ES() {
+	for ES_NODE in `grep ^${SHOW_ENV_NAME}_ES_CONF ~/bin/servers.arr | awk '{out=$3; for(i=4;i<=NF;i++){out=out" "$i}; print out}'`; do
+		for SERVER in "${SERVERS_ARRAY[@]}"; do
+			SERV=($SERVER)
+			if [[ "${SERV[0]}" = "$SHOW_ENV_NAME" && "${SERV[1]}" =~ ^(CPM|QUORUM)$ ]] && [[ "${SERV[6]}" == ${ES_NODE%:*} ]]; then
+				if [[ `grep ${ES_MULTI_CLUSTER^^} <<< ${ES_NODE}` ]]; then
+					ssh -qo BatchMode=yes ${SERV[2]} "bash -l -c \"export ES_MULTI_CLUSTER=${ES_MULTI_CLUSTER}; es_manage ${ES_MULTI_CLUSTER} $2 ${ENV_NAME} run_externally\"" 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED."
+					PIPE_EXIT_STATUS=${PIPESTATUS[0]}
+					[[ $2 == 'status' ]] && [[ ${PIPE_EXIT_STATUS} -eq 1 ]] && ERROR=1
+				fi
+			fi
+		done
+	done
+}
+
+#--------------------------------------------------------------------#
+#------------------------- COPYING SCRIPTS --------------------------#
+#--------------------------------------------------------------------#
+
+function MD5_SUM() {
+	for SERVER in "${SERVERS_ARRAY[@]}"; do
+		SERV=($SERVER)
+		# update scripts for current environment, declared environment type and for nodes that are different than set: current IP and current user
+		if [[ "${SERV[0]}" = "${SHOW_ENV_NAME}" && "${SERV[1]}" =~ ^(CPM|QUORUM)$ && "${SERV[6]} ${SERV[4]}" != "${IP_ADDRESS} ${CURRENT_USER}" ]]; then
+			SSH_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${SERV[4]}@${SERV[2]} echo confirmed 2>&1)
+			if [[ $SSH_STATUS == 'confirmed' ]]; then
+				SUM=(`ssh -qo BatchMode=yes ${SERV[4]}@${SERV[2]} md5sum $(echo ${SCRIPT_DIR} | sed "s|${CURRENT_USER}|${SERV[4]}|g") 2>&1 | grep -v "UNAUTHORIZED USE PROHIBITED."`)
+				if [[ ${md5_local[0]} != ${SUM[0]} ]]; then
+					RESULT=$(scp -pq ${SCRIPT_DIR} ${SERV[4]}@${SERV[2]}:$(echo ${SCRIPT_DIR} | sed "s|${CURRENT_USER}|${SERV[4]}|g") 2>&1); CODE=$?
+					if [ ${CODE} -ne 0 ]; then
+						echo -e "$(colored "31" "[ WARNING ]") Script `basename "$0"` encountered errors during scripts update (please contact ITOPS department)"
+						echo -e "$(colored "31" "[ WARNING ]") Error code: ${CODE}"
+						echo -e "$(colored "31" "[ WARNING ]") Error line: ${RESULT}"
+						exit 1
+					fi
+				fi
+			else
+				echo -e "$(colored "31" "[ WARNING ]") Script `basename "$0"` encountered errors during execution (please contact ITOPS department)"
+				echo -e "$(colored "31" "[ WARNING ]") SSH connection to remote host: ${SERV[4]}@${SERV[2]} is denied"
+				exit 1
+			fi
+		fi
+	done
+}
+
+#--------------------------------------------------------------------#
+#----------------------------- ES ARRAY -----------------------------#
+#--------------------------------------------------------------------#
+
+function GET_ES_ARRAY() {
+	args=() # reset to original state
+	cd ${SHOW_DEFAULT_PATH}/servers/ES
+
+	for i in `find . -maxdepth 1 -name "elasticsearch_*[[:digit:]]*" | sort --version-sort | cut -d'_' -f2-`; do
+		[[ ${ES_MULTI_CLUSTER} =~ ^(all|bpc)$ ]] && [[ $i =~ 'bpc' ]] && args+=("$i")
+		[[ ${ES_MULTI_CLUSTER} =~ ^(all|bss)$ ]] && [[ ! $i =~ 'bpc' ]] && args+=("$i")
+	done
+
+	local IFS=$'\n'
+	ES_ITER_ARRAY=( ${args[@]/\#*/} )
+}
+
+#--------------------------------------------------------------------#
+#--------------------------- PREREQUISITES --------------------------#
+#--------------------------------------------------------------------#
+
+# check if user links to proper environment
+if [ ${SHOW_ENV_NAME,,} != ${ENV_NAME,,} ]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong environment was definied during script induction."
+	echo -e "$(colored "31" "[ WARNING ]") Current environment: ${SHOW_ENV_NAME^^}. Definied environment: ${ENV_NAME^^}.\n"
+	exit 1
+fi
+
+# check if another process is running in parallel
+if [[ "${JOB}" =~ ^(stop|restart|start)$ ]] && [[ -z $(echo "$@" | grep -w 'current') ]]; then
+	mkdir -p ~/bin/PID_files # create required folders
+	([[ -f "$PID_FILE" ]] && [[ `cat $PID_FILE` ]]) && echo -e "$(colored "31" "[ WARNING ]") Another process with `cat $PID_FILE` PID is already written to $(basename $0).pid lockfile on ${IP_ADDRESS} ( ${HOSTNAME} )"
+	for CHECK_ANOTHER_PID in $(pidof -x $(basename $0)); do
+		if [ ${CHECK_ANOTHER_PID} != ${PARENT_PID} ]; then
+			echo -e "$(colored "31" "[ WARNING ]") Terminating already running process with ${CHECK_ANOTHER_PID} PID on ${IP_ADDRESS} ( ${HOSTNAME} )"
+			kill -9 ${CHECK_ANOTHER_PID} &>/dev/null # kill silently
+		fi
+	done
+	echo ${PARENT_PID} > "${PID_FILE}"
+fi
+
+
+
+# check value for simultaneously open files
+MAX_OPEN_FILES=`ulimit -a | grep open\ files | awk '{print $4}'`
+if [ $MAX_OPEN_FILES -lt '32000' ]; then
+	echo -e "\n$(colored "31" "[WARNING]") ElasticSearch requires at least 32 000 simultaneously open files to run properly"
+	echo -e "$(colored "31" "[WARNING]") Please change the ulimit value. Exiting.\n"
+	exit 1
+fi
+
+if [[ ${ES_INSTACE} == 'bpc' ]] && [[ -z `grep ^${SHOW_ENV_NAME}_ES_MULTI_CLUSTER ~/bin/servers.arr | grep BPC` ]]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") ElasticSearch's BPC instance is not available on ${ENV_NAME} environment."
+	echo -e "$(colored "31" "[ WARNING ]") ElasticSearch has to be deployed and configured first. Please contact ITOPS department."
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- CALLING FUNCTIONS ------------------------#
+#--------------------------------------------------------------------#
+
+[[ ${ES_INSTACE} =~ ^(all|$)$ ]] && ES_INSTANCES_LOOP=$(grep ^${SHOW_ENV_NAME}_ES_MULTI_CLUSTER ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}') || ES_INSTANCES_LOOP=${ES_INSTACE}
+ES_INSTANCES_LOOP=${ES_INSTANCES_LOOP,,} # unification of letters size for script induction and servers.arr configuration
+
+# update scripts on all nodes - comparing to main node
+if [[ "${JOB}" =~ ^(stop|restart|start|status)$ ]] && [[ -z $(echo "$@" | grep -w 'current') ]]; then
+	if [ "${IP_ADDRESS}" = "${LOCAL_HOST}" ] && [ ${REMOTE_HOST} != '0' ]; then
+		md5_local=`md5sum ${SCRIPT_DIR} | awk '{ print $1 }'`
+		MD5_SUM
+	fi
+fi
+
+for ES_MULTI_CLUSTER in ${ES_INSTANCES_LOOP}; do
+	WATERMARK_ERROR=FALSE # reset value for each cluster
+	GET_ES_ARRAY # generate matrix for es nodes
+	ES_ITER=${ES_ITER_ARRAY}
+	for ES_ITER in ${ES_ITER_ARRAY[@]}; do
+		gather_ES_HTTP_PORT
+
+		if grep -q ^cluster.routing.allocation.disk.watermark ${ES_PATH}${ES_ITER}/config/elasticsearch.yml; then
+			LOW_LIMIT=`grep ^cluster.routing.allocation.disk.watermark.low ${ES_PATH}${ES_ITER}/config/elasticsearch.yml | sed 's|[^0-9]*||g'`
+			HIGH_LIMIT=`grep ^cluster.routing.allocation.disk.watermark.low ${ES_PATH}${ES_ITER}/config/elasticsearch.yml | sed 's|[^0-9]*||g'`
+			SET_LIMIT="${LOW_LIMIT:-${HIGH_LIMIT}}"
+			[[ ${STORAGE_USED} -gt ${SET_LIMIT} ]] && {
+				echo -e "$(colored "31" "[ WARNING ]") Low disk watermark exceeded ( replicas will not be assigned ) on ${IP_ADDRESS} ( ${HOSTNAME} )"
+				echo -e "$(colored "31" "[ WARNING ]") Set watermark level in elasticsearch.yml ${SET_LIMIT}% is lower than used space on storage disks ${STORAGE_USED}%"
+				WATERMARK_ERROR=TRUE
+			}
+		fi
+
+		# elasticsearch backup: incremental method
+		([[ $IP_ADDRESS = $LOCAL_HOST ]] && [ "${JOB}" = 'backup' ]) && shared_resources
+
+		# determine standard actions: stop, restart
+		[[ "${JOB}" =~ ^(stop|restart|reconstruction)$ ]] && execute_task 'stop' 'STOP_ES' # determine standard actions
+
+		# elasticsearch reconstruction (repositories recreation) - only on main node
+		[[ "${JOB}" == reconstruction ]] && es_reconstruction data_remove # static indication (see header of script)
+
+		# determine standard actions: start, restart
+		[[ "${JOB}" =~ ^(restart|start|reconstruction)$ ]] && execute_task 'start' 'START_ES'
+
+		# elasticsearch reconstruction (repositories recreation) - only on main node
+		([[ $IP_ADDRESS = $LOCAL_HOST ]] && [ "${JOB}" = 'reconstruction' ]) && es_reconstruction recreate_repo
+
+		# for environments handling multiple instances on the same address - wait until the last element in array will be reached
+		if ([[ "${JOB}" =~ ^(start|restart)$ ]] && [[ "${ES_ITER}" == "${args[${#args[@]}-1]}" ]]) || [[ "${JOB}" == 'status' ]]; then
+			ES_STARTED=1 # set ElasticSearch's health check status to false
+			COUNTER_START=1 # variable used during status loop
+
+			while [[ "${ES_STARTED}" -ne 0 ]]; do
+				if [[ "${JOB}" =~ ^(start|restart)$ ]]; then
+					[[ $(check_parent_induction $@) -eq 0 ]] && break 2 # show verification of cluster status only if induction was launched internally (exclude mutiple verification on remote and local hosts)
+					echo -e "\n------------------------------------------------------------------"
+					echo -e "$(colored "35" "Checking status of ElasticSearch's cluster health")"
+					echo -e "Waiting until ElasticSearch starts - $((60*$((COUNTER_START++)))) sec"
+					echo "------------------------------------------------------------------"
+
+					# check status of ElasticSearch's health (red, yellow, green)
+					[[ `curl --user ${ES_USER}:${ES_PASSWORD} --max-time 10 --retry 3 -s http://${SEARCH_BIND_HOST}:${ES_HTTP_PORT}/_cluster/health | awk -F"," '{ print $2 }' | awk -F ":" '{ print $2 }' | sed 's/"//g'` == 'green' ]] && ES_STARTED=0
+
+					sleep 60
+				else
+					ES_STARTED=0 # break loop after first iteration
+				fi
+				execute_task 'status' 'STATUS_ES' # determine standard actions
+			done
+		fi
+	done
+done
+
+#--------------------------------------------------------------------#
+#-------------------- POST REQUIREMENTS CHECK -----------------------#
+#--------------------------------------------------------------------#
+
+# return error code, when '--performance' switch was in induction arguments or watermark was exceeded
+([[ ${WATERMARK_ERROR} == 'TRUE' ]] || [[ ${MONITOR_ANALYZER_ERROR} -eq 1 ]]) && exit 1 || exit 0

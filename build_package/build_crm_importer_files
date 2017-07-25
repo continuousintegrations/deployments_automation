@@ -1,0 +1,153 @@
+#!/bin/bash -
+# implementation repository is downloaded from local repository during execution of check_delivered_components script (key UPDATE_REPOSITORY in servers.arr has to be updated)
+# script requires to additional scripts: manifestTemplate.xml and xmlCombine3.py
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENETS ----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="04.07.2017r."
+SCRIPT_VERSION="0.0.6"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../common
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nCRM builder tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [version] [environment] [working_directory]")"
+	echo -e "$(colored "31" "[ WARNING ]") Working directory must correspond with repository structure (configuration-importer-data/<working_directory>)\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+WORKING_DIRECTORY=${VERSION_DIR}/working_directory
+TEMPORARY_DIRECTORY=${VERSION_DIR}/working_directory/temp_dir_lar
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function create_crm_components() {
+	ARRAY=("BPMProcessesFiles" "Organziations" "CustomAttributes" "ReportsFiles"); count=0 # array and variables initialization
+	for CRM_COMPONENT in bpm liferay-organizations liferay-custom-attributes ReportsFiles; do
+        if [[ -d ${WORKING_DIRECTORY}/${VARIABLE}/${CRM_COMPONENT} ]]; then
+        	cd ${WORKING_DIRECTORY}/${VARIABLE}/${CRM_COMPONENT}
+        	if [[ `ls | grep -v "^.git"` ]]; then
+        		echo -e "$(colored "32" "[ INFORMATION ]") Creating ${CRM_COMPONENT^^} component for ${VERSION} release"
+        		tar -cz --exclude='*.git*' --exclude='*${ARRAY[${count}]}.tar.gz*' -f ${ARRAY[${count}]}.tar.gz *
+        		mv ${ARRAY[${count}]}.tar.gz ${CRM_DIR}
+        		echo -e "$(colored "32" "[ BUILD INFORMATION ]") ${CRM_COMPONENT^^} component was successfully created and moved to ${CRM_DIR} location"
+        	fi
+        else
+        	echo -e "$(colored "31" "[ BUILD INFORMATION ]") Skipping creation of ${CRM_COMPONENT^^} component - there are no files remote in repository"
+        fi
+        (( count++ ))
+    done
+}
+
+function create_liferay_layouts() {
+	echo -e "$(colored "32" "[ INFORMATION ]") Creating LiferayLayouts component"
+	for LIFERAY_COMPONENT in 'Administration' 'CRM'; do
+		cd ${VERSION_DIR}/working_directory/tmp
+		if grep ^'BUILD_LIFERAY' ${SERVERS_ARR_FILE} | grep -q "${LIFERAY_COMPONENT}"; then
+			echo "Creating LiferayLayouts ${LIFERAY_COMPONENT} .lar files"
+			[[ ${LIFERAY_COMPONENT} == 'CRM' ]] && \
+			cp -r ${WORKING_DIRECTORY}/${VARIABLE}/liferay-layouts/Private\ pages/${LIFERAY_COMPONENT} ${LIFERAY_COMPONENT}/ || \
+			cp -r ${WORKING_DIRECTORY}/${VARIABLE}/liferay-layouts/Private\ pages/${LIFERAY_COMPONENT}/* ${LIFERAY_COMPONENT}/
+
+			unpackLARs >/dev/null
+			makeManifestAndLar >/dev/null
+			mv ../archive_*.lar ../tmp_lars/${LIFERAY_COMPONENT}.lar
+			rm -r ${VERSION_DIR}/working_directory/tmp/${LIFERAY_COMPONENT} # remove data to avoid incorrect creation of manifest.xml
+		else
+			echo -e "$(colored "31" "[ BUILD INFORMATION ]") Skipping build process of ${LIFERAY_COMPONENT}.lar file (key BUILD_LIFERAY)"
+		fi
+	done
+
+	echo "Creating LiferayLayouts archive"
+	cd ${WORKING_DIRECTORY}/tmp_lars; tar -cz --exclude='*.git*' --exclude='*LiferayLayouts.tar.gz*' -f ${CRM_DIR}/LiferayLayouts.tar.gz *.lar
+	echo -e "$(colored "32" "[ BUILD INFORMATION ]") Liferay Layouts component was successfully created and moved to ${CRM_DIR} location"
+}
+
+function unpackLARs() {
+	local IFS=$(echo -en "\n\b")
+	for FILE in $(find -type f -name *.lar); do
+		echo "Processing ${FILE} file"
+		unzip $FILE -d ${FILE%/*}
+		rm ${FILE}
+	done
+}
+
+function makeManifestAndLar() {
+	echo "Creating temporary manifest"
+	python2 ${BIN_PATH}/build_package/xmlCombine3.py "${BIN_PATH}/build_package/manifestTemplate.xml" "$(pwd)"
+	echo "File manifest_temporary.xml has been created"
+
+	local IFS=$(echo -en "\n\b")
+	echo "Moving manifest_temporary.xml to directory ${TEMPORARY_DIRECTORY}"
+	mv 'manifest_temporary.xml' ${TEMPORARY_DIRECTORY}'/manifest.xml'
+
+	DIRECTORIES=$(find -type d -name groups)
+	if [ -z "${DIRECTORIES}" ]; then
+		echo -e "$(colored "32" "[ WARNING ]") Skipping creation of LiferayLayouts package - there are no files in repository"
+		exit 1
+	else
+		for directory in ${DIRECTORIES}/; do
+			ls ${directory} | while read line; do
+				WIKI_GROUP=${line}
+				mkdir -p ${TEMPORARY_DIRECTORY}/groups/${WIKI_GROUP}
+				cp -r ${directory}/${WIKI_GROUP} ${TEMPORARY_DIRECTORY}/groups/
+				echo "Copied ${directory}/${WIKI_GROUP} to ${TEMPORARY_DIRECTORY}/groups/${WIKI_GROUP}"
+			done
+		done
+	fi
+
+	cd ${TEMPORARY_DIRECTORY}
+	echo "Creating archive"
+	NEWFILE="archive_`date +%d-%m-%y`.lar"
+	zip -r -q ${NEWFILE} ./ -x '.svn/*'
+	mv ${NEWFILE} '../'${NEWFILE}
+	[[ -z ${TEMPORARY_DIRECTORY} ]] && stop_deployment "Aborting deployment, because of lacking \${TEMPORARY_DIRECTORY} variable" || :
+    rm -rf ${TEMPORARY_DIRECTORY}/* # remove temporary directory
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+trap "[ ${TEMPORARY_DIRECTORY} ] && rm -rf -- ${WORKING_DIRECTORY}" SIGINT SIGTERM EXIT
+
+rm -rf ${VERSION_DIR}/working_directory/{tmp,tmp_lars,temp_dir_lar}/ # remove temporary directories
+mkdir -p ${VERSION_DIR}/working_directory/{tmp,tmp_lars} ${VERSION_DIR}/working_directory/tmp/{Administration,CRM} ${TEMPORARY_DIRECTORY}/groups # create required directories
+
+if [[ ! -f ${CRM_DIR}/${VERSION}_ConfigurationImporter.tar.gz ]]; then
+	echo -e "$(colored "31" "[ WARNING ]") Implementation package is missing in ${VERSION_DIR}"
+	echo -e "$(colored "31" "[ WARNING ]") Connection with local Git and configuration should be checked"
+	stop_deployment "Implementation package is missing in ${VERSION_DIR} location"
+else
+	echo -e "$(colored "32" "[ INFORMATION ]") Unpacking ${VERSION}_ConfigurationImporter.tar.gz implementation archive"
+	tar -zxf ${CRM_DIR}/${VERSION}_ConfigurationImporter.tar.gz -C ${WORKING_DIRECTORY} # unpack implementation package
+fi
+
+create_crm_components # create packages for bpm, custom attributes, organizations and reports files
+create_liferay_layouts # create package for liferay layouts

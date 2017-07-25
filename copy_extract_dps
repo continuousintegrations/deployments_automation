@@ -1,0 +1,109 @@
+#!/bin/bash -
+# build_date=04.07.2017
+# script supports configuration validation: servers.arr and dps.cfg (requires manual sids creation)
+# DPS sids creation: connect_string = "<SID>//<bs_database_address>:<port>/<USER>"
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="DPS_copyextract"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep DPS | head -n1 | awk '{ print $6 }'`
+
+#--------------------------------------------------------------------#
+#---------------------- PATHS AND VARIABLES -------------------------#
+#--------------------------------------------------------------------#
+
+FILE=$(find ${VERSION_DIR} -maxdepth 1 -name "DPS*-Linux*.sh" -printf '%T+ %p\n' | tail -n1 | awk '{print $2}') # get the newest DPS component from package
+# remove character '-' and replace with empty character to divide string and access each element separately (declare makes each name local - to set globally use switch '-g' - bash 4.2 and above)
+declare -a FNAME=(`basename ${FILE} | sed 's|-| |g'`)
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function check_version() {
+    CHECK_VERSION=$(basename ${FILE} | sed 's|DPS-||g' | sed 's|-Linux.*||g') # remove prefix 'DPS-' and suffix '-Linux*' from string ${FILE}
+    RESULT=$(ssh -qo BatchMode=yes ${USER}@${HOST} "bash -l -c 'ls -1 ${RHOME}/versions/${FNAME[1]}/builds | grep ${CHECK_VERSION}'" 2>&1) # check if build exists on remote server
+    if [ $? = 1 ]; then
+    	fLog "$(colored "32" "[ INFORMATION ]") Version ${CHECK_VERSION} is not installed on server. Processing component deployment."
+    	VERSION_EXISTS="false"
+    else
+    	fLog -n "$(colored "31" "[ WARNING ]") Version ${CHECK_VERSION} already exists on target environment. Aborting component deployment."
+    	VERSION_EXISTS="true"
+    fi
+}
+
+function copy_to_server() {
+	fLog "$(colored "34" "[ INFORMATION ]") Copying DPS binaries"
+	fLog "Files: `basename ${FILE}`"
+	fLog "Destination directory: ${RHOME}"
+    rsync -vrltD --stats --human-readable -e ssh ${FILE} ${USER}@${HOST}:${RHOME} # used rsync instead of scp, beacuase of partial output and better handling for large files
+	CODE=$?; check_errors
+	fLog "$(colored "32" "[ INFORMATION ]") DPS binaries copied successfully"
+}
+
+function extract_on_server() {
+	fLog "$(colored "34" "[ VALIDATION ]") Checking definied configuration in servers.arr and installed DPS SIDs"
+	DPS_SIDS=`grep ^DPS_SIDS ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'` # all available SID names declared in servers.arr (key: DPS_SIDS)
+	[[ -z ${DPS_SIDS} ]] && {
+		fLog "$(colored "31" "[ WARNING ]") String 'DPS_SIDS' is not definied in servers.arr configuration file"
+		stop_deployment "String 'DPS_SIDS' is not definied in servers.arr configuration file"
+	}
+
+	for DPS_SID_NAME in ${DPS_SIDS}; do
+		RESULT=$(run_remote_command ${HOST} -n "grep -q 'connect_string.*=.*//.*:[0-9]*/.*' ${RHOME}/admin/${DPS_SID_NAME}/dps.cfg")
+		if [[ $? -ne 0 ]]; then
+			fLog "$(colored "31" "[ WARNING ]") DPS ${DPS_SID_NAME} sid is not definied correctly on ${USER}@${HOST} (incorrect configuration in dps.cfg)"
+			stop_deployment "DPS ${DPS_SID_NAME} sid is not definied correctly"
+		fi
+	done
+	fLog "$(colored "32" "[ VALIDATION ]") Setup is correct. Processing application deployment."
+
+	fLog "$(colored "34" "[ INFORMATION ]") DPS binaries upgrade"
+	run_remote_command ${HOST} "chmod u+x ${RHOME}/`basename ${FILE}`"
+	run_remote_command ${HOST} "cd ${RHOME}; echo | ./`basename ${FILE}` --overwrite &>/dev/null"
+	fLog "$(colored "32" "[ INFORMATION ]") DPS binaries upgraded successfully"
+
+	for SID in ${DPS_SIDS}; do
+		fLog "Changing DPS version for ${SID} sid"
+		CHECK_CURRENT=$(run_remote_command ${HOST} "cd ${RHOME}/versions/${FNAME[1]}/cbin; ./dps.sh changeversion ${SID}")
+		fLog "$(colored "32" "[ INFORMATION ]") DPS version for ${SID} sid changed successfully"
+	done
+	fLog "$(colored "32" "[ INFORMATION ]") DPS upgrade performed successfully"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+	SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "DPS" ]]; then # execute for all DPS nodes
+    	HOST="${SERV[2]}"; USER="${SERV[4]}"
+
+    	check_version
+    	if [ ${VERSION_EXISTS} = "false" ]; then
+    		copy_to_server
+    		extract_on_server
+    	fi
+    fi
+done
+
+source ${BIN_PATH}/common_after

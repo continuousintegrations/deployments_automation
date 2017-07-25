@@ -1,0 +1,134 @@
+#!/bin/bash -
+# build_date=18.07.2017
+# script supports HOT_DEPLOY (variable ${SWITCH}) - switch '--silent' is required at the end of script induction
+# application should be declared in '${ENV}_APPS_CLUSTERING' key, if clustering is mendatory (BACKEND and FRONTEND variables)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="BSS_copyextract"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep CPM | head -n1 | awk '{ print $6 }'`
+
+# distinction between running component deployment on running or stopped system
+[[ ${@: -1} == '--silent' ]] && \
+{ echo -e "$(colored "32" "[ INFORMATION ]") Detected additional 'silent' switch. Processing component deployment on running system."; SWITCH='--silent'; } || \
+{ echo -e "$(colored "32" "[ INFORMATION ]") There is no additional switch in script induction. Running default component deployment."; SWITCH=''; }
+
+# for 7.1 systems deployed are: frontend, backend and cqrs, for 7.0 systems: frontend, for 7.2+ systems: backend and frontend
+BSS_LIST=$(grep ^BSS_LIST ${SERVERS_ARR_FILE} | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}')
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+SERVERS_PATH=${RHOME}/servers
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function search_for_components() {
+	SCP_LIST=''; GENERATE_COMMAND=''; GENERATE_COMMAND_SSH='' # reset to original state, because variables are increment during loop
+	fLog "$(colored "34" "[ INFORMATION ]") Searching for BSS Suite's components"
+	for BSS_COMPONENT in ${BSS_LIST}; do
+		COMPONENT_SEARCH=${BSS_COMPONENT%:*}; COMPONENT_NAME=${BSS_COMPONENT#*:}; BSS_SWITCH=${COMPONENT_NAME:0:1}
+		if [ -f ${VERSION_DIR}/${COMPONENT_SEARCH} ]; then
+			eval ${BSS_COMPONENT#*:}=`basename \`find ${VERSION_DIR} -name "${COMPONENT_SEARCH}" -printf '%T+ %p\n' | tail -n1 | awk '{print $2}'\`` # get the newest component name from package
+			eval ${COMPONENT_NAME%_*}='$'${BSS_COMPONENT#*:}
+			fLog "Found ${COMPONENT_NAME%_*} component: `eval echo '$'${BSS_COMPONENT#*:}`"
+			SCP_LIST+="`eval echo '$'${BSS_COMPONENT#*:}` " # generate components list dedicated for definied release (key BSS_LIST in servers.arr)
+			GENERATE_COMMAND+="-${BSS_SWITCH,,} `eval echo '$'${BSS_COMPONENT#*:}` " # generate deploy command
+			[[ `grep ^"${ENV}_APPS_CLUSTERING" ${SERVERS_ARR_FILE} | grep -w ${COMPONENT_NAME%_*}` ]] && GENERATE_COMMAND_SSH+="-${BSS_SWITCH,,} `eval echo '$'${BSS_COMPONENT#*:}` " # generate deploy command for remote hosts
+		else
+			fLog -n "$(colored "31" "[ CRITICAL ERROR ]") ${COMPONENT_NAME%_*} component was not found in delivered ${VERSION} package. Aborting deployment."
+			fLog -n "$(colored "31" "[ CRITICAL ERROR ]") Delivered release should be verified or configuration in servers.arr changed"
+			stop_deployment "${COMPONENT_NAME%_*} component was not found in delivered ${VERSION} package"
+		fi
+	done
+}
+
+function copy_to_server() {
+	run_remote_command ${SERV[2]} "mkdir -p ${SERVERS_PATH}/{zip_files,scripts,launcher/builds}" # create required directories
+
+	fLog "$(colored "34" "[ INFORMATION ]") Copying BSS binaries deployment script"
+	fLog "Destination directory: ${BIN_DIR}"
+	RESULT=$(scp -pq ${TOSERVERS_PATH}/bss_binaries ${USER}@${HOST}:${BIN_DIR} 2>&1)
+	CODE=$?; check_errors
+	fLog "$(colored "32" "[ INFORMATION ]") BSS binaries deployment script copied successfully"
+
+	fLog "$(colored "34" "[ INFORMATION ]") Copying BSS Suite's binaries"
+	fLog "Destination directory: ${SERVERS_PATH}/zip_files"
+	fLog "Copying deployment scripts: `echo ${SCP_LIST} | sed 's| |, |g'`"
+	# used rsync instead of scp, beacuase of partial output and better handling for large files
+	rsync -vrltD --stats --human-readable -e ssh `echo ${SCP_LIST} | sed "s|[^ ]* *|${VERSION_DIR}/&|g"` ${USER}@${HOST}:${SERVERS_PATH}/zip_files
+	CODE=$?; check_errors
+	fLog "$(colored "32" "[ INFORMATION ]") BSS Suite's binaries copied successfully"
+}
+
+function extract_on_server() {
+	run_remote_command ${SERV[2]} "chmod 764 ${BIN_DIR}/bss_binaries"
+	fLog "$(colored "34" "[ INFORMATION ]") BSS Suite upgrade"
+
+	if [[ "${SYSTEM_VERSION}" -ge '71' ]]; then
+		fLog "Destination directory: ${SERVERS_PATH}/launcher/builds"
+
+		if [[ "${SERV[3]}" = "1" ]]; then
+			fLog "Upgrade of BSS: `echo ${GENERATE_COMMAND} | sed 's|-. ||g'`"
+			run_remote_command ${SERV[2]} "bss_binaries ${GENERATE_COMMAND} ${SWITCH}"
+		elif [[ ${GENERATE_COMMAND_SSH} ]]; then
+			fLog "Upgrade of BSS: `echo ${GENERATE_COMMAND_SSH} | sed 's|-. ||g'`"
+			run_remote_command ${SERV[2]} "bss_binaries ${GENERATE_COMMAND_SSH} ${SWITCH}"
+		fi
+	else
+		fLog -n "Performing applications backup: bss-launcher, bss-ngt-rest-api, cpm-pml-cli"
+		run_remote_command ${SERV[2]} "mkdir -p ${REMOTE_HOME}/servers/application_backup/$(date +'%Y%m%d')" # create required directories
+		run_remote_command ${SERV[2]} "mv ${REMOTE_HOME}/servers/{bss-launcher,bss-ngt-rest-api,cpm-pml-cli} ${REMOTE_HOME}/servers/application_backup/$(date +'%Y%m%d')"
+
+		fLog "Unpacking launcher binaries: ${LAUNCHER} to directory ${REMOTE_HOME}/servers/bss-launcher"
+		run_remote_command ${SERV[2]} "unzip ${SERVERS_PATH}/zip_files/${LAUNCHER} -d ${REMOTE_HOME}/servers/bss-launcher >/dev/null"
+		
+		fLog "Unpacking RestAPI binaries: ${RESTAPI} to directory ${REMOTE_HOME}/servers/bss-ngt-rest-api"
+		run_remote_command ${SERV[2]} "unzip ${SERVERS_PATH}/zip_files/${RESTAPI} -d ${REMOTE_HOME}/servers >/dev/null"
+		run_remote_command ${SERV[2]} "mv \$(find ${REMOTE_HOME}/servers -maxdepth 1 -type d -name \"bss-ngt-rest-api*\") ${REMOTE_HOME}/servers/bss-ngt-rest-api"
+		run_remote_command ${SERV[2]} "cp -r ${REMOTE_HOME}/servers/application_backup/$(date +'%Y%m%d')/bss-ngt-rest-api/conf/* ${REMOTE_HOME}/servers/bss-ngt-rest-api/conf"
+
+		fLog "Unpacking PML CLI binaries: ${PML_CLI} to directory ${REMOTE_HOME}/servers/cpm-pml-cli"
+		run_remote_command ${SERV[2]} "unzip ${SERVERS_PATH}/zip_files/${PML_CLI} -d ${REMOTE_HOME}/servers/cpm-pml-cli >/dev/null"
+		run_remote_command ${SERV[2]} "cp ${REMOTE_HOME}/servers/application_backup/$(date +'%Y%m%d')/cpm-pml-cli/bin/bss.properties ${REMOTE_HOME}/servers/cpm-pml-cli/bin"
+	fi
+	fLog "$(colored "32" "[ INFORMATION ]") BSS upgrade performed successfully"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+	SERV=($SERVER)
+	if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "CPM" ]]; then
+		HOST="${SERV[2]}"; USER="${SERV[4]}"; REMOTE_HOME="${SERV[5]}"
+
+		search_for_components
+		copy_to_server
+		extract_on_server
+	fi
+done
+
+source ${BIN_PATH}/common_after

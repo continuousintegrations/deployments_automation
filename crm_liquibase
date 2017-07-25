@@ -1,0 +1,78 @@
+#!/bin/bash -
+# build_date=21.07.2017
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="CRM_liquibase_changeset"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep -w ^"${ENV}" ${SERVERS_ARR_FILE} | grep CRM | head -n1 | awk '{ print $6 }'`
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+SERVERS_PATH=${RHOME}/liquibase/changes/Liquibase_installation_`date +%Y-%m-%d`
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function copy_to_server() {
+    fLog "$(colored "34" "[ INFORMATION ]") Copying CRM database upgrade script"
+    fLog "Destination directory: ${BIN_DIR}"
+    RESULT=$(scp -pq ${TOSERVERS_PATH}/upgrade_crm_db ${USER}@${HOST}:${BIN_DIR} 2>&1)
+    CODE=$?; check_errors
+    run_remote_command ${SERV[2]} "chmod 764 ${BIN_DIR}/upgrade_crm_db ${RHOME}/liquibase/bin/ant" # redundant confer rights (not throwing errors if required permissions have not been set)
+    fLog "$(colored "32" "[ INFORMATION ]") CRM database upgrade script copied successfully"
+
+    fLog "\n$(colored "34" "[ INFORMATION ]") Searching and copying CRM liquibases"
+    find ${CRM_DIR} -type f \( -iname "Liquibase*.tar.gz" -o -iname "Liquibase*.zip" \) -exec basename {} \; | sort -V > ${CRM_DIR}/packages_crm
+    fLog "$(colored "35" "[ INFORMATION ]") Found following database packages: `cat ${CRM_DIR}/packages_crm | sed ':a;N;$!ba;s/\n/ /g'`"
+    fLog "Destination directory: ${SERVERS_PATH}"
+    run_remote_command ${SERV[2]} "mkdir -p ${SERVERS_PATH}" >/dev/null # create required directories
+    RESULT=$(scp -pq ${CRM_DIR}/packages_crm ${CRM_DIR}/Liquibase* ${USER}@${HOST}:${SERVERS_PATH} 2>&1)
+    CODE=$?; check_errors
+    fLog "$(colored "32" "[ INFORMATION ]") CRM changeset package list copied successfully"
+}
+
+function liquibase_upgrade() {
+    fLog "$(colored "34" "[ INFORMATION ]") CRM database upgrade"
+    VERSION_LIQUIBAE=${VERSION%to*} # get lower boundary version from definied range
+    # additional parameter required for packages containing multiple branches in one release (redefine bugfix number to master branch version - all versions below are removed, version must exist)
+    VERSION_MAPPING=$(echo ${VERSION_LIQUIBAE} | sed 's|\.[[:digit:]]$|.0|')
+    run_remote_command ${SERV[2]} "upgrade_crm_db all ${VERSION_MAPPING}" # parameter defines schema upgrade: all, crm, liferay, bpm, bs, esb
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+    SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "CRM" && "${SERV[3]}" = "1" ]]; then
+        USER="${SERV[4]}"; HOST="${SERV[2]}"
+
+        copy_to_server
+        liquibase_upgrade
+        break
+    fi
+done
+
+source ${BIN_PATH}/common_after
